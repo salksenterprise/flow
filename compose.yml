@@ -1,0 +1,14 @@
+services:
+  workflow-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - workflow-data:/data
+    restart: unless-stopped
+
+volumes:
+  workflow-data:
+
