@@ -1,0 +1,24 @@
+{
+  "key":"threat-model-assessment",
+  "name":"Threat Model Assessment",
+  "description":"Example external-domain workflow using the generic engine.",
+  "domain":"EXAMPLE",
+  "version":1,
+  "publish":true,
+  "steps":[
+    {"key":"scope","name":"Define scope","type":"HUMAN_TASK","stage":"Scope","assignment_role":"REQUESTOR"},
+    {"key":"model","name":"Document model","type":"HUMAN_TASK","stage":"Model","assignment_role":"MODELER"},
+    {"key":"fork","name":"Start reviews","type":"FORK","stage":"Review"},
+    {"key":"review_a","name":"Specialist review A","type":"HUMAN_TASK","stage":"Review","assignment_role":"REVIEWER_A"},
+    {"key":"review_b","name":"Specialist review B","type":"HUMAN_TASK","stage":"Review","assignment_role":"REVIEWER_B"},
+    {"key":"join","name":"Reviews complete","type":"JOIN","stage":"Review","join_rule":"ALL"},
+    {"key":"decision","name":"Record decision","type":"DECISION","stage":"Decision","assignment_role":"DECISION_OWNER"},
+    {"key":"end","name":"Complete","type":"END","stage":"End"}
+  ],
+  "transitions":[
+    {"from_step":"scope","to_step":"model"},{"from_step":"model","to_step":"fork"},
+    {"from_step":"fork","to_step":"review_a"},{"from_step":"fork","to_step":"review_b"},
+    {"from_step":"review_a","to_step":"join"},{"from_step":"review_b","to_step":"join"},
+    {"from_step":"join","to_step":"decision"},{"from_step":"decision","to_step":"end"}
+  ]
+}

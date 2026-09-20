@@ -1,0 +1,38 @@
+{
+  "key": "information-security-review",
+  "name": "Information Security Review",
+  "description": "Example integration template; the external ISR service owns assessments and requirements.",
+  "domain": "EXAMPLE",
+  "version": 1,
+  "publish": true,
+  "steps": [
+    {"key":"intake","name":"Complete intake","type":"HUMAN_TASK","stage":"Intake","assignment_role":"REQUESTOR"},
+    {"key":"categorize","name":"Categorize and engage","type":"DECISION","stage":"Categorization","assignment_role":"REVIEW_COORDINATOR"},
+    {"key":"design","name":"Primary design review","type":"HUMAN_TASK","stage":"Design Review","assignment_role":"PRIMARY_REVIEWER"},
+    {"key":"fork_sme","name":"Start selected reviews","type":"FORK","stage":"Design Review"},
+    {"key":"identity_sme","name":"Identity specialist review","type":"HUMAN_TASK","stage":"Design Review","assignment_role":"IDENTITY_SME"},
+    {"key":"network_sme","name":"Network specialist review","type":"HUMAN_TASK","stage":"Design Review","assignment_role":"NETWORK_SME"},
+    {"key":"architecture_sme","name":"Architecture specialist review","type":"HUMAN_TASK","stage":"Design Review","assignment_role":"ARCHITECTURE_SME"},
+    {"key":"join_sme","name":"Required reviews complete","type":"JOIN","stage":"Design Review","join_rule":"ALL"},
+    {"key":"consolidate","name":"Consolidate conclusion","type":"DECISION","stage":"Design Review","assignment_role":"PRIMARY_REVIEWER"},
+    {"key":"build","name":"Implement reviewed design","type":"HUMAN_TASK","stage":"Build","assignment_role":"IMPLEMENTER"},
+    {"key":"validate","name":"Validate implementation","type":"HUMAN_TASK","stage":"Validate","assignment_role":"VALIDATOR"},
+    {"key":"end","name":"End review","type":"END","stage":"End"}
+  ],
+  "transitions": [
+    {"from_step":"intake","to_step":"categorize"},
+    {"from_step":"categorize","to_step":"design"},
+    {"from_step":"design","to_step":"fork_sme"},
+    {"from_step":"fork_sme","to_step":"identity_sme","condition":{"field":"identity_review_required","operator":"truthy"}},
+    {"from_step":"fork_sme","to_step":"network_sme","condition":{"field":"network_review_required","operator":"truthy"}},
+    {"from_step":"fork_sme","to_step":"architecture_sme"},
+    {"from_step":"identity_sme","to_step":"join_sme","condition":{"field":"identity_review_required","operator":"truthy"}},
+    {"from_step":"network_sme","to_step":"join_sme","condition":{"field":"network_review_required","operator":"truthy"}},
+    {"from_step":"architecture_sme","to_step":"join_sme"},
+    {"from_step":"join_sme","to_step":"consolidate"},
+    {"from_step":"consolidate","to_step":"build"},
+    {"from_step":"build","to_step":"validate"},
+    {"from_step":"validate","to_step":"end"}
+  ]
+}
+
