@@ -1,103 +1,137 @@
-# Configurable Review Workflow Engine
+# Flow
 
-A runnable MVP for configurable review workflows using FastAPI, SQLite, and React.
+Flow is a configurable workflow execution engine built from a domain-neutral Python core, a SQLite persistence adapter, a FastAPI microservice, a delivery worker, and a React administration console.
 
-The engine keeps workflow mechanics generic. Information Security Review, Security Architecture Review, and Threat Model Assessment are supplied as template data rather than hard-coded processes.
+The engine executes workflow graphs and FSM-controlled steps. It does not own information-security requirements, assessments, threats, architecture records, findings, or other client-domain data.
 
-## Features
+## Architecture
 
-- Versioned workflow definitions
-- Configurable step and transition graph
-- FSM-controlled human, decision, fork, join, milestone, and end steps
-- Conditional transitions using a small declarative rule format
-- Parallel step execution and `ALL` / `ANY` joins
-- Request/reviewer clarification loops within a step FSM
-- User and team assignments
-- Generic workflow subjects such as applications and technologies
-- Append-only workflow event log
-- Seeded Information Security Review and Threat Model templates
-- React screens for templates, launching workflows, running steps, and viewing history
+```text
+Domain applications
+    ISR, architecture, threat modeling, vendor review
+                        |
+                        | commands and events
+                        v
+Workflow API -> workflow-core -> SQLite adapter
+      |               |
+      |               +-- graph orchestration
+      |               +-- step FSMs
+      |               +-- conditions and joins
+      v
+Transactional outbox -> delivery worker -> webhooks
+```
+
+Repository layout:
+
+```text
+packages/workflow-core       Pure Python engine and repository ports
+packages/workflow-sqlite     SQLite schema and repository adapter
+services/workflow-api        FastAPI service adapter
+services/workflow-worker     Outbox/webhook delivery process
+frontend                     React administration console
+examples                     External-domain templates and clients
+tests                        Cross-component engine tests
+docs                         Integration contract
+```
 
 ## Run with Docker
 
-From the extracted `workflow-engine` directory:
+Docker builds the React interface inside the image, so Node and npm are not required on the host.
 
 ```bash
 docker compose up --build
 ```
 
-Open `http://localhost:8000`. Stop it with:
+Open:
+
+- Console: `http://localhost:8000`
+- API documentation: `http://localhost:8000/docs`
+
+Stop the services:
 
 ```bash
 docker compose down
 ```
 
-Workflow data persists in the `workflow-data` Docker volume. To stop the app and intentionally delete its database:
+Workflow data persists in the `workflow-data` volume. Delete it intentionally with:
 
 ```bash
 docker compose down --volumes
 ```
 
-Docker builds the React interface inside the image, so Node and npm do not need to be installed on the host.
-
-## Run without Docker, Node, or npm
-
-The package includes a prebuilt React interface served by FastAPI:
+## Run locally
 
 ```bash
-cd backend
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r services/workflow-api/requirements.txt
+pip install -e packages/workflow-core -e packages/workflow-sqlite
+
+export PYTHONPATH="$PWD/packages/workflow-core/src:$PWD/packages/workflow-sqlite/src:$PWD/services/workflow-api:$PWD/services/workflow-worker"
+uvicorn app.main:app --app-dir services/workflow-api --reload --port 8000
 ```
 
-Open `http://localhost:8000`. The API documentation is at `http://localhost:8000/docs`.
+In another terminal, optionally run the delivery worker:
 
-## Frontend development
+```bash
+source .venv/bin/activate
+export PYTHONPATH="$PWD/packages/workflow-core/src:$PWD/packages/workflow-sqlite/src:$PWD/services/workflow-api:$PWD/services/workflow-worker"
+python -m worker.main
+```
 
-Node and npm are needed only when changing the React source. In that case, start the backend as above and run:
+Node is needed only for frontend development:
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-Open `http://localhost:5173`. Vite proxies `/api` calls to the backend.
+## Generic runtime concepts
 
-The SQLite database is created as `backend/workflow.db`. Override it with `WORKFLOW_DB_PATH`.
+- Immutable, versioned workflow definitions
+- Human, decision, automated, fork, join, milestone, and end steps
+- Independent FSM state for every step instance
+- Conditional transitions using a constrained JSON rule language
+- Parallel branches with `ALL` and `ANY` joins
+- Clarification and response cycles inside human work
+- Generic subjects and opaque business references
+- Role, group, or user assignments
+- Optimistic workflow revisions
+- Idempotent client commands
+- Ordered audit events
+- Transactional event outbox and signed webhooks
 
-## Step FSM
+## Client integration
 
-```text
-NOT_READY -> READY -> ASSIGNED -> IN_PROGRESS -> COMPLETED
-                                  |       ^
-                                  v       |
-                         CLARIFICATION_REQUIRED
-                                  |
-                         AWAITING_RESPONSE
-                                  |
-                          RESPONSE_RECEIVED
-
-Terminal alternatives: SKIPPED, FAILED, CANCELLED
-```
-
-System steps (`FORK`, `JOIN`, `MILESTONE`, and `END`) are driven automatically. A join activates when its configured `ALL` or `ANY` completion rule is satisfied.
-
-## Condition format
-
-Transitions may contain a JSON condition evaluated against workflow input data:
+A client starts a workflow with its own business reference:
 
 ```json
-{"field": "local_component", "op": "eq", "value": true}
+{
+  "command_id": "client-generated-uuid",
+  "workflow_version_id": 1,
+  "title": "Review ASMT-502",
+  "business_type": "ISR_ASSESSMENT",
+  "business_key": "ASMT-502",
+  "correlation_id": "ISR-REQ-200",
+  "variables": {"identity_review_required": true},
+  "subjects": []
+}
 ```
 
-Supported operators: `eq`, `ne`, `in`, `not_in`, `exists`, and `truthy`. Conditions may be combined with `all`, `any`, and `not`.
+The engine treats all domain values as opaque. See [docs/integration.md](docs/integration.md) and the [ISR example](examples/information-security-review/README.md).
+
+## Rule format
+
+```json
+{"field": "specialist_review_required", "operator": "eq", "value": true}
+```
+
+Supported operators: `eq`, `ne`, `in`, `not_in`, `exists`, and `truthy`. Compose rules with `all`, `any`, and `not`. Rules are data and cannot execute arbitrary code.
 
 ## Tests
 
 ```bash
-cd backend
+export PYTHONPATH="$PWD/packages/workflow-core/src:$PWD/packages/workflow-sqlite/src:$PWD/services/workflow-api:$PWD/services/workflow-worker"
 python -m unittest discover -s tests -v
 ```

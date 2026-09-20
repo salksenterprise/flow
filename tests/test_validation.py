@@ -1,0 +1,29 @@
+import unittest
+
+from workflow_core.errors import ValidationError
+from workflow_core.validation import validate_template
+
+
+class TemplateValidationTests(unittest.TestCase):
+    def test_rejects_unreachable_step(self):
+        with self.assertRaises(ValidationError):
+            validate_template({
+                "steps": [
+                    {"key": "start", "type": "HUMAN_TASK"},
+                    {"key": "orphan", "type": "HUMAN_TASK"},
+                    {"key": "end", "type": "END"},
+                ],
+                "transitions": [{"from_step": "start", "to_step": "end"}],
+            })
+
+    def test_join_requires_rule(self):
+        with self.assertRaises(ValidationError):
+            validate_template({
+                "steps": [{"key": "start", "type": "HUMAN_TASK"}, {"key": "join", "type": "JOIN"}, {"key": "end", "type": "END"}],
+                "transitions": [{"from_step": "start", "to_step": "join"}, {"from_step": "join", "to_step": "end"}],
+            })
+
+
+if __name__ == "__main__":
+    unittest.main()
+
