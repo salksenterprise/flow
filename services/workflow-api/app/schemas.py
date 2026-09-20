@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -36,17 +37,6 @@ class TemplateImport(BaseModel):
     steps: list[StepDefinitionIn]
     transitions: list[TransitionIn]
 
-    @model_validator(mode="after")
-    def validate_graph(self):
-        keys = [step.key for step in self.steps]
-        if len(keys) != len(set(keys)):
-            raise ValueError("Step keys must be unique")
-        known = set(keys)
-        for edge in self.transitions:
-            if edge.from_step not in known or edge.to_step not in known:
-                raise ValueError(f"Unknown transition endpoint: {edge.from_step} -> {edge.to_step}")
-        return self
-
 
 class SubjectIn(BaseModel):
     subject_type: str
@@ -56,20 +46,33 @@ class SubjectIn(BaseModel):
 
 
 class WorkflowStart(BaseModel):
+    command_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     workflow_version_id: int
     title: str
-    created_by: str = "demo.user"
-    input: dict[str, Any] = Field(default_factory=dict)
+    business_type: str | None = None
+    business_key: str | None = None
+    correlation_id: str | None = None
+    actor: str = "api.user"
+    variables: dict[str, Any] = Field(default_factory=dict)
     subjects: list[SubjectIn] = Field(default_factory=list)
 
 
 class StepAction(BaseModel):
+    command_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     action: Literal[
         "assign", "start", "wait", "resume", "request_clarification",
-        "respond", "complete", "skip", "fail", "cancel"
+        "respond", "complete", "skip", "fail", "cancel",
     ]
-    actor: str = "demo.user"
+    actor: str = "api.user"
+    expected_revision: int | None = None
     assignee: str | None = None
     assignee_type: str = "USER"
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WebhookSubscriptionIn(BaseModel):
+    name: str
+    target_url: str
+    event_types: list[str] = Field(default_factory=list)
+    secret: str | None = None
 

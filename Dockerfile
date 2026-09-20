@@ -12,14 +12,19 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    WORKFLOW_DB_PATH=/data/workflow.db
+    WORKFLOW_DB_PATH=/data/workflow.db \
+    WORKFLOW_EXAMPLES_PATH=/app/examples \
+    PYTHONPATH=/app/packages/workflow-core/src:/app/packages/workflow-sqlite/src:/app/services/workflow-api:/app/services/workflow-worker
 
 WORKDIR /app
 
-COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+COPY services/workflow-api/requirements.txt /app/services/workflow-api/requirements.txt
+RUN pip install --no-cache-dir -r /app/services/workflow-api/requirements.txt
 
-COPY backend/app /app/backend/app
+COPY packages /app/packages
+RUN pip install --no-cache-dir /app/packages/workflow-core /app/packages/workflow-sqlite
+COPY services /app/services
+COPY examples /app/examples
 COPY --from=frontend-build /build/frontend/dist /app/frontend/dist
 
 RUN useradd --create-home --uid 10001 workflow \
@@ -27,7 +32,7 @@ RUN useradd --create-home --uid 10001 workflow \
     && chown -R workflow:workflow /app /data
 
 USER workflow
-WORKDIR /app/backend
+WORKDIR /app/services/workflow-api
 
 EXPOSE 8000
 

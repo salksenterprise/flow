@@ -1,5 +1,6 @@
-backend/.venv/
-backend/workflow.db
+.venv/
+backend/
+workflow.db
 frontend/node_modules/
 frontend/dist/
 __pycache__/
