@@ -47,6 +47,15 @@ Open:
 - Console: `http://localhost:8000`
 - API documentation: `http://localhost:8000/docs`
 
+
+If port 8000 is already in use, choose another host port:
+
+```bash
+FLOW_PORT=8080 docker compose up --build
+```
+
+Then open `http://localhost:8080`.
+
 Stop the services:
 
 ```bash
