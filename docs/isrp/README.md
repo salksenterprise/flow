@@ -6,7 +6,7 @@ Documents:
 
 - [Architecture](architecture.md): service boundaries, lifecycle model, DAG/FSM responsibilities, actor modes, and parent-child status aggregation.
 - [Workflow visual guide](workflow-visual-guide.md): ASCII walkthrough of request FSMs, request DAGs, assessment FSMs, assessment DAGs, step FSMs, parallel reviews, and status roll-ups.
-- [Data model](data-model.md): logical entities, relational design, document projections, portability, audit, and consistency rules.
+- [Canonical data model](data-model.md): the consolidated source of truth for all ISRP and Flow-related entities, relationships, constraints, history, evidence, requirements, projections, events, portability, and future extensions.
 - [Flow to IS Requirements](requirements-catalog.md): catalog structure, requirement selection, work packages, actor assertions, evidence, decisions, audit, and workflow integration.
 - [RDBMS status projections](status-projections.md): authoritative lifecycle states, derived status summaries, outbox processing, parallel phases, and closure validation.
 - [Current and future phases](phases.md): deterministic current scope and separately governed future AI-assisted capabilities.

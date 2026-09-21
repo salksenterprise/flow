@@ -1,5 +1,7 @@
 # Current and Future ISRP Phases
 
+> Canonical model: All entity definitions, fields, relationships, constraints, and ownership decisions are consolidated in [Data model](data-model.md). This document describes behavior and uses abbreviated entity views only.
+
 ## Purpose
 
 This document establishes a firm delivery boundary between the current deterministic ISRP implementation and future AI-assisted capabilities.

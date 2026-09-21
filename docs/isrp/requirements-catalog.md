@@ -1,5 +1,7 @@
 # Flow to IS Requirements
 
+> Canonical model: All entity definitions, fields, relationships, constraints, and ownership decisions are consolidated in [Data model](data-model.md). This document describes behavior and uses abbreviated entity views only.
+
 ## Purpose
 
 This document explains how the generic Flow workflow service and the ISRP requirements domain work together. Flow controls orchestration and work progression. ISRP controls the meaning, selection, response, evidence, review, and decision history of security requirements.

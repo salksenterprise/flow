@@ -1,5 +1,7 @@
 # RDBMS Status Projections
 
+> Canonical model: All entity definitions, fields, relationships, constraints, and ownership decisions are consolidated in [Data model](data-model.md). This document describes behavior and uses abbreviated entity views only.
+
 ## Purpose
 
 This document defines how request-level and assessment-level statuses are stored and maintained using the same PostgreSQL or Oracle database as the authoritative ISRP model.
