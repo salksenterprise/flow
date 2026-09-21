@@ -57,8 +57,6 @@ CREATE TABLE IF NOT EXISTS workflow_instance (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
   suspended_at TEXT, cancelled_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_workflow_business ON workflow_instance(business_type, business_key);
-CREATE INDEX IF NOT EXISTS idx_workflow_correlation ON workflow_instance(correlation_id);
 CREATE TABLE IF NOT EXISTS workflow_subject (
   id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_instance_id INTEGER NOT NULL REFERENCES workflow_instance(id),
   subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, source_system TEXT NOT NULL,
@@ -102,7 +100,6 @@ CREATE TABLE IF NOT EXISTS signal_receipt (
   received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, consumed_at TEXT,
   consumed_step_instance_id INTEGER REFERENCES step_instance(id)
 );
-CREATE INDEX IF NOT EXISTS idx_signal_match ON signal_receipt(workflow_instance_id,signal_type,correlation_key,consumed_at);
 CREATE TABLE IF NOT EXISTS automation_job (
   id INTEGER PRIMARY KEY AUTOINCREMENT, job_key TEXT NOT NULL UNIQUE,
   workflow_instance_id INTEGER NOT NULL REFERENCES workflow_instance(id),
@@ -112,7 +109,6 @@ CREATE TABLE IF NOT EXISTS automation_job (
   available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, claimed_by TEXT, claimed_at TEXT,
   lease_expires_at TEXT, completed_at TEXT, last_error TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_automation_claim ON automation_job(status,available_at,id);
 CREATE TABLE IF NOT EXISTS durable_timer (
   id INTEGER PRIMARY KEY AUTOINCREMENT, timer_key TEXT NOT NULL UNIQUE,
   workflow_instance_id INTEGER NOT NULL REFERENCES workflow_instance(id),
@@ -120,7 +116,6 @@ CREATE TABLE IF NOT EXISTS durable_timer (
   action TEXT NOT NULL, due_at TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
   status TEXT NOT NULL DEFAULT 'SCHEDULED', fired_at TEXT, cancelled_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_timer_due ON durable_timer(status,due_at,id);
 CREATE TABLE IF NOT EXISTS workflow_event (
   id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
   workflow_instance_id INTEGER NOT NULL REFERENCES workflow_instance(id),
@@ -159,6 +154,27 @@ CREATE TABLE IF NOT EXISTS outbox_delivery (
   attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, delivered_at TEXT,
   UNIQUE(outbox_event_id, subscription_id)
 );
+CREATE TABLE IF NOT EXISTS schema_metadata (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# Created only after the legacy migration, which adds the columns some of
+# these indexes reference.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_workflow_business ON workflow_instance(business_type, business_key);
+CREATE INDEX IF NOT EXISTS idx_workflow_correlation ON workflow_instance(correlation_id);
+CREATE INDEX IF NOT EXISTS idx_signal_match ON signal_receipt(workflow_instance_id,signal_type,correlation_key,consumed_at);
+CREATE INDEX IF NOT EXISTS idx_automation_claim ON automation_job(status,available_at,id);
+CREATE INDEX IF NOT EXISTS idx_timer_due ON durable_timer(status,due_at,id);
 CREATE INDEX IF NOT EXISTS idx_step_instance_workflow ON step_instance(workflow_instance_id);
 CREATE INDEX IF NOT EXISTS idx_event_workflow ON workflow_event(workflow_instance_id, sequence_number);
+CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_event(status,next_attempt_at,id);
+CREATE INDEX IF NOT EXISTS idx_workflow_parent ON workflow_instance(parent_workflow_instance_id);
 """
+
+# Stamped into schema_metadata on first initialization. Its presence is what
+# tells initialize() that the legacy 0.2 migration has already been applied and
+# must never run against live rows again.
+SCHEMA_VERSION = 3

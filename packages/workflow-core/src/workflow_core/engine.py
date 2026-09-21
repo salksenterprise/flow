@@ -92,6 +92,9 @@ class WorkflowEngine:
 
     def start_child_workflow(self, parent_id: int, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
+            previous = self.repository.command_result(command["command_id"])
+            if previous:
+                return previous
             parent = self.repository.get_instance_row(parent_id)
             if not parent:
                 raise NotFoundError("Parent workflow instance not found")
@@ -251,7 +254,8 @@ class WorkflowEngine:
                     )
                 if transition.get("reason_required") and not command.get("reason"):
                     raise ValidationError("A reason is required for this transition")
-                if transition.get("required_permission") not in (None, "") and +                        transition["required_permission"] not in actor_permissions(command):
+                permission = transition.get("required_permission")
+                if permission and permission not in actor_permissions(command):
                     raise ConflictError("Workflow transition permission denied")
                 values["lifecycle_state"] = transition["to_state"]
                 if self.repository.state_is_terminal(
@@ -273,6 +277,8 @@ class WorkflowEngine:
                 previous=previous_state, new=values.get("lifecycle_state", previous_state),
                 payload={"reason": command.get("reason")}, actor_org_id=actor_org(command),
             )
+            if values.get("execution_status") == "CANCELLED":
+                self._cancel_execution(workflow_id, actor_id(command), command.get("reason"))
             if values.get("execution_status") == "RUNNING":
                 self._drive(workflow_id)
             result = self.get_workflow(workflow_id)
@@ -371,10 +377,12 @@ class WorkflowEngine:
                     "status": "SUCCEEDED", "result": command.get("result", {}),
                     "completed_at": now(), "lease_expires_at": None,
                 })
-                self._complete_system_step(
-                    job["workflow_instance_id"], self.repository.get_step(job["step_instance_id"]),
-                    "AUTOMATION_SUCCEEDED", command.get("result", {}),
-                )
+                owner = self.repository.get_instance_row(job["workflow_instance_id"])
+                if owner and owner["execution_status"] == "RUNNING":
+                    self._complete_system_step(
+                        job["workflow_instance_id"], self.repository.get_step(job["step_instance_id"]),
+                        "AUTOMATION_SUCCEEDED", command.get("result", {}),
+                    )
             elif job["attempt_count"] < job["max_attempts"]:
                 delay = int(command.get("retry_after_seconds", 2 ** job["attempt_count"]))
                 self.repository.update_job(job_id, {
@@ -418,6 +426,21 @@ class WorkflowEngine:
                         )
                         self._drive(timer["workflow_instance_id"])
             return len(timers)
+
+    def _cancel_execution(self, workflow_id: int, actor: str, reason: str | None) -> None:
+        """Cancel a workflow's open work, then every running descendant."""
+        self.repository.cancel_open_work(workflow_id)
+        for child_id in self.repository.running_child_ids(workflow_id):
+            child = self.repository.get_instance_row(child_id)
+            self.repository.update_workflow(child_id, {
+                "execution_status": "CANCELLED", "status": "CANCELLED",
+                "cancelled_at": now(), "revision": child["revision"] + 1,
+            })
+            self.repository.append_event(
+                child_id, "WORKFLOW_CANCELLED_BY_PARENT", actor,
+                payload={"parent_workflow_instance_id": workflow_id, "reason": reason},
+            )
+            self._cancel_execution(child_id, actor, reason)
 
     def _can_activate(self, workflow: dict[str, Any], step: dict[str, Any]) -> bool:
         incoming = self.repository.incoming(workflow["id"], step["step_definition_id"])
@@ -576,6 +599,13 @@ class WorkflowEngine:
                         self.repository.consume_signal(signal["id"], step["id"])
                         self._complete_system_step(
                             workflow_id, step, "SIGNAL_CONSUMED", signal.get("payload", {})
+                        )
+                        changed = True
+                elif step["step_type"] == "AUTOMATED_TASK":
+                    job = self.repository.job_for_step(step["id"])
+                    if job and job["status"] == "SUCCEEDED":
+                        self._complete_system_step(
+                            workflow_id, step, "AUTOMATION_SUCCEEDED", job.get("result") or {}
                         )
                         changed = True
                 elif step["step_type"] == "SUBWORKFLOW":

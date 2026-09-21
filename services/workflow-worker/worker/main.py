@@ -51,10 +51,16 @@ def deliver(event: dict, subscription: dict) -> tuple[bool, str | None]:
 
 
 def run_once() -> int:
-    subscriptions = repository.list_subscriptions(active_only=True)
+    # The worker is the only caller that needs signing secrets.
+    subscriptions = repository.list_subscriptions(active_only=True, include_secrets=True)
     processed = 0
     for event in repository.pending_outbox():
-        targets = [item for item in subscriptions if accepts(item, event["event_type"])]
+        # A retry must not re-post to a subscription that already accepted the
+        # event, or every failing subscriber turns into duplicate deliveries
+        # for every healthy one.
+        already_delivered = repository.delivered_subscription_ids(event["id"])
+        targets = [item for item in subscriptions
+                   if accepts(item, event["event_type"]) and item["id"] not in already_delivered]
         success = True
         for target in targets:
             delivered, error = deliver(event, target)
