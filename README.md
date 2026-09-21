@@ -133,7 +133,9 @@ A client starts a workflow with its own business reference:
 }
 ```
 
-The engine treats all domain values as opaque. See [docs/integration.md](docs/integration.md),
+The engine treats all domain values as opaque. See the
+[workflow engine documentation](docs/workflow-engine/README.md),
+[integration contract](docs/integration.md),
 [Releases 1–3](docs/workflow-engine-releases-1-3.md), and the
 [ISR example](examples/information-security-review/README.md).
 
