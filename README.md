@@ -99,13 +99,18 @@ npm run dev
 ## Generic runtime concepts
 
 - Immutable, versioned workflow definitions
-- Human, decision, automated, fork, join, milestone, and end steps
-- Independent FSM state for every step instance
+- Versioned, configurable workflow lifecycle and step FSMs
+- Human, decision, automated, subworkflow, signal-wait, timer, fork, join, milestone, and end steps
+- Separate lifecycle, workflow-execution, and node-execution states
 - Conditional transitions using a constrained JSON rule language
-- Parallel branches with `ALL` and `ANY` joins
+- Parallel branches with `ALL`, `ANY`, and `N_OF_M` joins
+- Parent-child workflows with required and optional children
+- Idempotent inbound signals and controlled workflow facts
 - Clarification and response cycles inside human work
-- Generic subjects and opaque business references
-- Role, group, or user assignments
+- Generic subjects, opaque business references, and work iterations
+- User, role, group, and organization assignment context
+- Asynchronous automation jobs, durable timers, retries, and leases
+- Durable inbox, transactional outbox, webhook retries, and dead-letter status
 - Optimistic workflow revisions
 - Idempotent client commands
 - Ordered audit events
@@ -128,7 +133,9 @@ A client starts a workflow with its own business reference:
 }
 ```
 
-The engine treats all domain values as opaque. See [docs/integration.md](docs/integration.md) and the [ISR example](examples/information-security-review/README.md).
+The engine treats all domain values as opaque. See [docs/integration.md](docs/integration.md),
+[Releases 1–3](docs/workflow-engine-releases-1-3.md), and the
+[ISR example](examples/information-security-review/README.md).
 
 ## Rule format
 

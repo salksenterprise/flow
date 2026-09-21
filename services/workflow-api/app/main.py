@@ -8,14 +8,24 @@ from workflow_core import ConflictError, NotFoundError, ValidationError, Workflo
 from workflow_sqlite import SQLiteWorkflowRepository
 
 from .config import DATABASE_PATH, EXAMPLES_PATH, FRONTEND_DIST
-from .schemas import StepAction, TemplateImport, WebhookSubscriptionIn, WorkflowStart
+from .schemas import (
+    AutomationResult,
+    ExternalEventIn,
+    FactUpdate,
+    SignalIn,
+    StepAction,
+    TemplateImport,
+    WebhookSubscriptionIn,
+    WorkflowAction,
+    WorkflowStart,
+)
 from .template_loader import load_examples
 
 
 repository = SQLiteWorkflowRepository(DATABASE_PATH)
 engine = WorkflowEngine(repository)
 
-app = FastAPI(title="Generic Workflow Service", version="0.2.0")
+app = FastAPI(title="Generic Workflow Service", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -77,9 +87,49 @@ def workflow(workflow_id: int):
     return invoke(lambda: engine.get_workflow(workflow_id))
 
 
+@app.post("/api/workflows/{workflow_id}/children", status_code=201)
+def create_child_workflow(workflow_id: int, body: WorkflowStart):
+    return invoke(lambda: engine.start_child_workflow(workflow_id, body.model_dump()))
+
+
+@app.post("/api/workflows/{workflow_id}/actions")
+def workflow_action(workflow_id: int, body: WorkflowAction):
+    return invoke(lambda: engine.apply_workflow_action(workflow_id, body.model_dump()))
+
+
+@app.post("/api/workflows/{workflow_id}/facts")
+def update_workflow_facts(workflow_id: int, body: FactUpdate):
+    return invoke(lambda: engine.update_facts(workflow_id, body.model_dump()))
+
+
+@app.post("/api/workflows/{workflow_id}/signals")
+def signal_workflow(workflow_id: int, body: SignalIn):
+    return invoke(lambda: engine.receive_signal(workflow_id, body.model_dump()))
+
+
+@app.post("/api/workflows/{workflow_id}/external-events")
+def external_event(workflow_id: int, body: ExternalEventIn):
+    return invoke(lambda: engine.ingest_external_event(workflow_id, body.model_dump()))
+
+
 @app.post("/api/steps/{step_id}/actions")
 def step_action(step_id: int, body: StepAction):
     return invoke(lambda: engine.apply_action(step_id, body.model_dump()))
+
+
+@app.get("/api/automation/jobs")
+def claim_automation_jobs(worker_id: str, limit: int = 10):
+    return engine.claim_automation_jobs(worker_id, limit)
+
+
+@app.post("/api/automation/jobs/{job_id}/result")
+def automation_result(job_id: int, body: AutomationResult):
+    return invoke(lambda: engine.complete_automation_job(job_id, body.model_dump()))
+
+
+@app.post("/api/timers/process")
+def process_timers():
+    return {"processed": engine.process_due_timers()}
 
 
 @app.get("/api/webhook-subscriptions")
@@ -94,4 +144,3 @@ def create_webhook_subscription(body: WebhookSubscriptionIn):
 
 if FRONTEND_DIST.exists():
     app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
-

@@ -3,10 +3,25 @@ from __future__ import annotations
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 
-StepType = Literal["HUMAN_TASK", "DECISION", "AUTOMATED_TASK", "FORK", "JOIN", "MILESTONE", "END"]
+StepType = Literal[
+    "HUMAN_TASK", "DECISION", "AUTOMATED_TASK", "FORK", "JOIN",
+    "SUBWORKFLOW", "WAIT_SIGNAL", "TIMER", "MILESTONE", "END",
+]
+
+
+class ActorContext(BaseModel):
+    actor_id: str
+    actor_type: str = "USER"
+    organization_id: str | None = None
+    roles: list[str] = Field(default_factory=list)
+    groups: list[str] = Field(default_factory=list)
+    permissions: list[str] = Field(default_factory=list)
+
+
+Actor = str | ActorContext
 
 
 class StepDefinitionIn(BaseModel):
@@ -16,7 +31,8 @@ class StepDefinitionIn(BaseModel):
     stage: str = ""
     description: str = ""
     assignment_role: str | None = None
-    join_rule: Literal["ALL", "ANY"] | None = None
+    join_rule: Literal["ALL", "ANY", "N_OF_M", "ALL_REQUIRED"] | None = None
+    fsm: dict[str, Any] | None = None
     configuration: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -34,6 +50,7 @@ class TemplateImport(BaseModel):
     domain: str = "GENERIC"
     version: int = 1
     publish: bool = True
+    lifecycle_fsm: dict[str, Any] | None = None
     steps: list[StepDefinitionIn]
     transitions: list[TransitionIn]
 
@@ -52,22 +69,70 @@ class WorkflowStart(BaseModel):
     business_type: str | None = None
     business_key: str | None = None
     correlation_id: str | None = None
-    actor: str = "api.user"
+    actor: Actor = "api.user"
     variables: dict[str, Any] = Field(default_factory=dict)
     subjects: list[SubjectIn] = Field(default_factory=list)
+    parent_step_instance_id: int | None = None
+    relationship_type: str | None = None
+    relationship_key: str | None = None
+    required: bool = True
 
 
 class StepAction(BaseModel):
     command_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    action: Literal[
-        "assign", "start", "wait", "resume", "request_clarification",
-        "respond", "complete", "skip", "fail", "cancel",
-    ]
-    actor: str = "api.user"
+    action: str
+    actor: Actor = "api.user"
     expected_revision: int | None = None
+    reason: str | None = None
     assignee: str | None = None
     assignee_type: str = "USER"
+    organization_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowAction(BaseModel):
+    command_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    action: str
+    actor: Actor = "api.user"
+    expected_revision: int | None = None
+    reason: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class FactUpdate(BaseModel):
+    command_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    actor: Actor = "api.user"
+    expected_revision: int | None = None
+    facts: dict[str, Any]
+    source_type: str = "COMMAND"
+    source_reference: str | None = None
+
+
+class SignalIn(BaseModel):
+    command_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    actor: Actor = "api.user"
+    signal_type: str
+    correlation_key: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    apply_facts: bool = False
+
+
+class ExternalEventIn(BaseModel):
+    connector_name: str
+    provider_event_id: str
+    event_type: str
+    correlation_key: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    apply_facts: bool = False
+
+
+class AutomationResult(BaseModel):
+    command_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    actor: Actor = "automation.worker"
+    success: bool = True
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    retry_after_seconds: int | None = None
 
 
 class WebhookSubscriptionIn(BaseModel):
@@ -75,4 +140,3 @@ class WebhookSubscriptionIn(BaseModel):
     target_url: str
     event_types: list[str] = Field(default_factory=list)
     secret: str | None = None
-

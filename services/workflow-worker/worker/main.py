@@ -9,12 +9,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from workflow_core import WorkflowEngine
 from workflow_sqlite import SQLiteWorkflowRepository
 
 
 DATABASE_PATH = Path(os.environ.get("WORKFLOW_DB_PATH", "/data/workflow.db"))
 POLL_SECONDS = float(os.environ.get("WORKFLOW_POLL_SECONDS", "2"))
 repository = SQLiteWorkflowRepository(DATABASE_PATH)
+engine = WorkflowEngine(repository)
 
 
 def accepts(subscription: dict, event_type: str) -> bool:
@@ -58,9 +60,9 @@ def run_once() -> int:
             delivered, error = deliver(event, target)
             repository.record_delivery(event["id"], target["id"], delivered, error)
             success = success and delivered
-        repository.mark_outbox(event["id"], success)
+        repository.mark_outbox(event["id"], success, None if success else "One or more deliveries failed")
         processed += 1
-    return processed
+    return processed + engine.process_due_timers()
 
 
 def main() -> None:
@@ -72,4 +74,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
