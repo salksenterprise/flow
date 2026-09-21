@@ -91,8 +91,13 @@ def decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 class SQLiteWorkflowRepository:
-    def __init__(self, path: str | Path):
-        self.path = str(path)
+    def __init__(self, path: str | Path | None = None):
+        """Standalone with a path; embedded with none.
+
+        Embedded, the host binds its own connection with using(), and Flow
+        never opens, commits, rolls back or closes one.
+        """
+        self.path = str(path) if path is not None else None
         self._local = threading.local()
 
     @property
@@ -105,6 +110,11 @@ class SQLiteWorkflowRepository:
         self._local.connection = value
 
     def _connect(self) -> sqlite3.Connection:
+        if self.path is None:
+            raise RuntimeError(
+                "This repository is embedded and has no database path. The host "
+                "must bind its own connection: `with repository.using(connection):`"
+            )
         connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode = WAL")
@@ -113,30 +123,66 @@ class SQLiteWorkflowRepository:
         return connection
 
     def initialize(self) -> None:
-        """Create the schema, and migrate a legacy database exactly once.
+        """Standalone convenience: open a connection, install the schema, close it.
 
-        Safe to call on every process start. The legacy 0.2 migration rewrites
-        state derived from column values, so it runs only for a populated
-        database that predates version stamping, never again afterwards.
+        An embedding host calls create_schema() from its own migration step
+        instead, so that Flow's tables are versioned alongside the host's.
         """
         connection = self._connect()
         try:
-            legacy = self._legacy_database(connection)
-            connection.executescript(SCHEMA)
+            self.create_schema(connection)
         finally:
             connection.close()
-        with self.transaction():
+
+    def create_schema(self, connection: sqlite3.Connection) -> None:
+        """Install or upgrade Flow's tables on a host-supplied connection.
+
+        Safe to call on every start. The legacy 0.2 migration rewrites state
+        derived from column values, so it runs only for a populated database
+        that predates version stamping, and never again afterwards.
+
+        This must not run inside an open transaction: schema changes commit
+        implicitly in SQLite, which would commit whatever the host had in
+        flight alongside them.
+        """
+        if connection.in_transaction:
+            raise RuntimeError(
+                "create_schema cannot run inside an open transaction: DDL commits "
+                "implicitly and would commit the host's uncommitted work with it"
+            )
+        legacy = self._legacy_database(connection)
+        connection.executescript(SCHEMA)
+        with self.using(connection):
             lifecycle_id = self._ensure_fsm(DEFAULT_LIFECYCLE_FSM, "WORKFLOW")
             step_id = self._ensure_fsm(DEFAULT_STEP_FSM, "STEP")
             if self._schema_version() is None:
                 if legacy:
                     self._migrate_legacy_schema(lifecycle_id, step_id)
                 self._stamp_schema_version()
-        connection = self._connect()
+        connection.commit()
+        # Indexes last: on a legacy database some of them reference columns the
+        # migration has only just added.
+        connection.executescript(INDEXES)
+        connection.commit()
+
+    @contextmanager
+    def using(self, connection: sqlite3.Connection) -> Iterator[None]:
+        """Bind a host-owned connection for the duration of the block.
+
+        Flow reads and writes through it but never commits, rolls back or
+        closes it. The host decides where the transaction ends, which is what
+        lets a domain write and a workflow transition commit as one unit.
+        """
+        if self._connection is not None:
+            raise RuntimeError("A connection is already bound on this thread")
+        previous_factory = connection.row_factory
+        connection.row_factory = sqlite3.Row
+        self._connection = connection
         try:
-            connection.executescript(INDEXES)
+            yield
         finally:
-            connection.close()
+            self._connection = None
+            connection.row_factory = previous_factory
 
     @staticmethod
     def _legacy_database(connection: sqlite3.Connection) -> bool:

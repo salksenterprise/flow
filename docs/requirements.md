@@ -29,22 +29,24 @@ work. Every `Defect` row below was reproduced against the current code.
 
 ## A. Embedding contract
 
-The differentiating requirements. All are new.
+The differentiating requirements. `examples/embedded-host` is the reference
+integration and `tests/test_embedding.py` holds the contract.
 
 | ID | Requirement | Status |
 |---|---|---|
-| EMB-1 | The host supplies an open database connection or session; Flow never opens one | Planned |
-| EMB-2 | The host opens and commits the transaction; Flow calls no commit or rollback | Planned |
-| EMB-3 | A domain write and a workflow transition in one host transaction commit atomically | Planned |
+| EMB-1 | The host supplies an open database connection or session; Flow never opens one | Done |
+| EMB-2 | The host opens and commits the transaction; Flow calls no commit or rollback | Done |
+| EMB-3 | A domain write and a workflow transition in one host transaction commit atomically | Done |
 | EMB-4 | Flow raises typed errors the host can catch and roll back on; no bare exceptions escape | Partial |
 | EMB-5 | Flow's tables carry a configurable name prefix to avoid collision with host tables | Planned |
-| EMB-6 | Flow owns its own migration chain, runnable from the host's migration tool | Planned |
+| EMB-6 | Flow owns its own migration chain, runnable from the host's migration tool | Done |
 | EMB-7 | Schema creation is explicit and idempotent; importing Flow never mutates a database | Done |
 | EMB-8 | Actor identity is a typed value passed in-process; Flow never parses credentials | Partial |
-| EMB-9 | Background routines (timers, jobs, delivery) are callable functions the host schedules | Partial |
+| EMB-9 | Background routines (timers, jobs, delivery) are callable functions the host schedules | Done |
 | EMB-10 | The core is safe to use concurrently from a multi-threaded host process | Done |
 | EMB-11 | The core imports only the standard library and its own ports | Done |
-| EMB-12 | Embedded and service modes run the same core through the same repository ports | Partial |
+| EMB-12 | Embedded and service modes run the same core through the same repository ports | Done |
+| EMB-13 | A host may hold a real foreign key from its own tables into Flow's | Done |
 
 ## B. Definitions
 
@@ -154,27 +156,29 @@ The differentiating requirements. All are new.
 | NFR-1 | The definition format contains no Python-specific semantics | Done |
 | NFR-2 | Repository behavior is defined by a contract suite every adapter must pass | Planned |
 | NFR-3 | The same contract suite runs against SQLite and the production database in CI | Planned |
-| NFR-4 | A host test suite runs Flow with no container, network or background process | Partial |
+| NFR-4 | A host test suite runs Flow with no container, network or background process | Done |
 | NFR-5 | No interface accepts self-asserted actor permissions | Defect |
 | NFR-6 | Runtime queries used on a request path are indexed and bounded | Partial |
 | NFR-7 | The graph driver terminates or raises rather than looping unbounded | Untested |
 | NFR-8 | Timestamps use one representation throughout | Partial |
 
 
+
 ## Status summary
 
 ~~~text
-Done        34
+Done        42
 Untested    17
-Partial     11
+Partial      8
 Defect       2
-Planned     22
-total       86
+Planned     18
+total       87
 ~~~
 
-34 of 86 requirements are backed by a test, up from 24 before the P0 work.
-The suite is 36 tests, up from 22. Coverage of failure paths is still thin:
-guard refusal, retry exhaustion and lease expiry remain untested.
+42 of 87 requirements are backed by a test: 24 at the first audit, 34 after
+the P0 fixes, 42 once the embedding spike landed. The suite is 48 tests, up
+from 22. Failure-path coverage is still thin: guard refusal, retry
+exhaustion and lease expiry remain untested.
 
 ## Verified defects
 

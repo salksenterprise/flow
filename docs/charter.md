@@ -123,9 +123,22 @@ follow; none block the first release.
 
 ## Open questions
 
-1. Which production database is authoritative. The Flow documents name Oracle
-   first; the ISRP documents name PostgreSQL first. One must change.
-2. Whether any embedding host will require a JVM runtime. Treated as Python-only
-   for now, with the portability constraint above protecting the option.
-3. Whether the operator console remains a Flow deliverable or becomes the host
+1. Whether any embedding host will require a JVM runtime. Treated as
+   Python-only for now, with the portability constraint above protecting the
+   option.
+2. Whether the operator console remains a Flow deliverable or becomes the host
    application's responsibility.
+3. What a repeated command returns: the original result exactly as stored, or
+   the workflow's current state. See OPS-7 in the requirements.
+
+## Decided
+
+**Oracle is the production adapter.** SQLite stays for development and tests.
+PostgreSQL follows only if a need for it appears. The ISRP documents name
+PostgreSQL first and are now out of date on this point.
+
+**The transaction is host-owned.** Proven by `examples/embedded-host` and
+`tests/test_embedding.py`: the host supplies the connection, Flow never
+commits, rolls back or closes it, and a domain write and a workflow transition
+commit as one unit. The host's table carries a real foreign key into
+`workflow_instance`, which a separate service could not offer.
