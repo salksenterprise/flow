@@ -1,4 +1,5 @@
 # Flow
+# a workflow engine
 
 Flow is a configurable workflow execution engine built from a domain-neutral Python core, a SQLite persistence adapter, a FastAPI microservice, a delivery worker, and a React administration console.
 
