@@ -60,7 +60,7 @@ Human intake
   -> human response and citations
   -> human SME review and clarification
   -> human final decision
-  -> deterministic findings/issues, joins, projections, and closure checks
+  -> deterministic finding disposition, remediation/CAP/issue integration, validation, joins, projections, and closure checks
 ~~~
 
 ## Current human responsibilities
@@ -207,7 +207,10 @@ Implement now:
 - reviewer determinations
 - final decisions
 - append-only comments and justifications
-- findings and issue references
+- assessment-owned findings, finding-to-requirement and finding-to-subject links
+- remediation cases, corrective action plans, action items, and external issue references
+- deterministic validation work after external issue resolution
+- inbound integration event deduplication and reconciliation
 - metadata proposals from RULE or INTEGRATION
 - audit, outbox, processed-event, and RDBMS status projections
 

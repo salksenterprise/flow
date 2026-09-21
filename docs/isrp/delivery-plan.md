@@ -196,22 +196,32 @@ Acceptance:
 - Parallel review branches remain visible without forcing a misleading single current phase.
 - Rebuilding projections produces the same result as incremental processing.
 
-## Iteration 10: Findings and issue integration
+## Iteration 10: Findings, remediation, CAP, and issue integration
 
 Deliver:
 
-- Findings
-- Noncompliance classification
-- Issue eligibility and closure policies
-- Issue-management outbox connector
-- External issue references and status synchronization
-- Reconciliation operation
+- Assessment-owned findings linked to affected requirements and subjects
+- Explicit finding disposition: fix in assessment, register noncompliance, risk exception, or not a finding
+- Remediation cases that can group one or more findings
+- Corrective action plans, action items, ownership, target dates, and evidence links
+- Noncompliance eligibility and closure policies
+- Issue-management outbox connector using NONCOMPLIANCE_REGISTRATION_REQUESTED
+- External issue references owned by remediation cases
+- INTEGRATION_INBOX_EVENT for idempotent provider updates
+- Status synchronization and reconciliation
+- Deterministic validation work after external resolution
+- Finding, remediation, issue, CAP, and validation-pending projections
 
 Acceptance:
 
+- A finding remains owned by the assessment that discovered it and can link to multiple requirements and subjects.
+- Several findings can share one remediation case without losing traceability.
 - Retrying issue creation produces one external issue.
-- An assessment can close with an open issue only when policy permits.
+- Replaying one inbound provider event does not duplicate state changes or validation work.
+- An externally resolved issue moves remediation to validation pending and does not automatically close a finding.
+- An assessment can close with an open issue, remediation case, or CAP action only when explicit policy permits.
 - External status changes are traceable and reconcilable.
+- Request-level counts derive through assessments instead of duplicated request-owned findings.
 
 ## Iteration 11: Enterprise controls
 

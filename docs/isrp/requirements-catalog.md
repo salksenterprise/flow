@@ -338,6 +338,37 @@ NOT_MET
 
 A child requirement change updates assessment projections. Assessment changes update request projections. Parent states summarize inner execution but do not mirror every child state. The initial implementation stores these projections in the same PostgreSQL or Oracle database and maintains them from OUTBOX_EVENT records. Controlled closure operations always revalidate authoritative child records. See [RDBMS status projections](status-projections.md).
 
+## From requirement gap to remediation
+
+A NOT_MET or PARTIALLY_MET decision can lead to a finding, but the decision and finding are separate records. The final decision preserves the compliance conclusion; the finding manages treatment.
+
+~~~text
+ASSESSMENT_REQUIREMENT
+  -> REQUIREMENT_FINAL_DECISION
+       -> FINDING_REQUIREMENT
+            -> FINDING
+                 -> fix during assessment
+                 or
+                 -> REMEDIATION_CASE
+                      -> ISSUE_REFERENCE
+                      -> CORRECTIVE_ACTION_PLAN
+~~~
+
+A finding can cover several related requirements, and a requirement can participate in more than one distinct finding when policy allows. FINDING_SUBJECT identifies which scoped application, technology, vendor, or product is affected.
+
+Actors record an explicit disposition and append-only justification:
+
+~~~text
+FIX_IN_ASSESSMENT
+REGISTER_NONCOMPLIANCE
+RISK_EXCEPTION
+NOT_A_FINDING
+~~~
+
+For FIX_IN_ASSESSMENT, new response, evidence, determination, and final-decision versions are created as needed; submitted history is not overwritten. For REGISTER_NONCOMPLIANCE, ISRP creates or links a remediation case and asynchronously requests an issue in the external system.
+
+External issue resolution is evidence of progress, not an ISRP compliance decision. It creates validation work for an authorized reviewer. Only that validation can support new requirement decisions and finding resolution.
+
 ## Transaction and audit invariants
 
 - Outcome changes and their justification commit atomically.
@@ -348,7 +379,7 @@ A child requirement change updates assessment projections. Assessment changes up
 - Submitted records, evidence versions, citations, comments, determinations, and decisions are not edited in place.
 - The business history remains authoritative even if audit events are exported elsewhere.
 
-Important audit events include requirement selection, scope amendment, assignment, draft update, submission, clarification, comment, evidence attachment or replacement, citation supersession, assertion, determination, final decision, exception, finding, and issue creation.
+Important audit events include requirement selection, scope amendment, assignment, draft update, submission, clarification, comment, evidence attachment or replacement, citation supersession, assertion, determination, final decision, exception, finding creation and disposition, remediation-case linkage, CAP approval and action completion, issue registration and synchronization, and ISRP validation.
 
 ## Example: external product with infrastructure component
 

@@ -134,7 +134,7 @@ request_revision
 
 ASSESSMENT_STATUS_HISTORY has the equivalent assessment fields.
 
-These tables record explicit lifecycle transitions. They do not need a row for every derived count change because requirement, work-package, decision, evidence, finding, and issue records already provide authoritative history.
+These tables record explicit lifecycle transitions. They do not need a row for every derived count change because requirement, work-package, decision, evidence, finding, remediation-case, issue-reference, CAP, and validation records already provide authoritative history.
 
 ## Request status projection
 
@@ -160,7 +160,10 @@ stale_evidence_count
 outdated_implementation_count
 
 open_finding_count
+active_remediation_case_count
 open_issue_count
+overdue_cap_action_count
+validation_pending_count
 
 source_version
 projected_at
@@ -190,7 +193,10 @@ not_applicable_requirement_count
 stale_evidence_count
 outdated_implementation_count
 open_finding_count
+active_remediation_case_count
 open_issue_count
+overdue_cap_action_count
+validation_pending_count
 
 active_work_package_count
 blocked_work_package_count
@@ -269,7 +275,12 @@ FINAL_DECISION_RECORDED
 EVIDENCE_FRESHNESS_CHANGED
 IMPLEMENTATION_CURRENCY_CHANGED
 FINDING_STATUS_CHANGED
+REMEDIATION_CASE_STATUS_CHANGED
 ISSUE_STATUS_CHANGED
+CAP_STATUS_CHANGED
+CAP_ACTION_STATUS_CHANGED
+REMEDIATION_VALIDATION_REQUESTED
+FINDING_VALIDATED
 ~~~
 
 ## Projector transaction
@@ -425,6 +436,22 @@ A command response may return:
 
 The UI can update optimistically or briefly display that the summary is refreshing.
 
+## Remediation-aware closure policy
+
+Request and assessment projections expose operational counts but do not decide whether a review may close. The policy engine reads authoritative rows and evaluates, at minimum:
+
+- unresolved findings and their dispositions
+- active remediation cases
+- external issue references and their observed status
+- incomplete or overdue CAP actions
+- risk exceptions and expiration
+- remediation items awaiting ISRP validation
+- whether the configured workflow permits post-review remediation
+
+A policy may permit an assessment to complete while remediation continues externally, but that outcome must be explicit. The finding and remediation case remain active after assessment completion, continue to roll up to the request/reporting context, and retain their original assessment ownership.
+
+An external status of RESOLVED increments validation_pending_count until an authorized ISRP validation records the result. It must not decrement open_finding_count by itself.
+
 ## Closure validation
 
 A projection is a query optimization, not an authorization source.
@@ -434,7 +461,7 @@ Close-assessment validation reads authoritative data:
 1. Verify all required assessment requirements.
 2. Verify final-decision authority and current decisions.
 3. Verify required work packages and joins.
-4. Evaluate findings, issues, exceptions, and closure policy.
+4. Evaluate findings, remediation cases, issue references, CAP actions, exceptions, validation state, and closure policy.
 5. Check the assessment revision.
 6. Execute the assessment FSM transition.
 7. Append status history, audit, and outbox records.

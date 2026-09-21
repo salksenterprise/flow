@@ -19,7 +19,7 @@ The model covers:
 - responses, assertions, determinations, and final decisions
 - higher-level evidence, immutable evidence versions, and citations
 - append-only comments and justifications
-- findings, issues, exceptions, and closure
+- findings, affected subjects, remediation cases, issues, CAPs, exceptions, validation, and closure
 - audit, idempotency, outbox, and processed events
 - request and assessment status projections
 - PostgreSQL and Oracle portability
@@ -83,7 +83,7 @@ Large evidence files live in controlled object/document storage. The RDBMS store
 - work-package business scope
 - responses and evidence
 - assertions, determinations, and decisions
-- findings, issue links, and exceptions
+- findings, remediation cases, CAPs, external issue references, and exceptions
 - lifecycle transition history
 - audit and business outbox events
 - request and assessment status projections
@@ -126,8 +126,13 @@ ISRP_REQUEST
   |      |      +--< WORK_PACKAGE_REQUIREMENT
   |      |      +--< WORK_PACKAGE_ASSIGNMENT
   |      |
-  |      +--< FINDING >--< FINDING_REQUIREMENT
-  |      +--< ISSUE_REFERENCE
+  |      +--< FINDING
+  |             +--< FINDING_REQUIREMENT
+  |             +--< FINDING_SUBJECT
+  |             +--< REMEDIATION_CASE_FINDING >-- REMEDIATION_CASE
+  |                                                   +--< ISSUE_REFERENCE
+  |                                                   +--< CORRECTIVE_ACTION_PLAN
+  |                                                          +--< CAP_ACTION_ITEM
   |
   +--< REQUEST_EVIDENCE >-- EVIDENCE_ITEM
                               |
@@ -1393,7 +1398,13 @@ Justification is mandatory for:
 
 The justification is stored on the immutable record that performs the change. Additional narrative is appended through REQUIREMENT_COMMENT.
 
-# Part X: Findings, issues, and exceptions
+# Part X: Findings, remediation, issues, CAPs, and exceptions
+
+## Ownership rule
+
+FINDING belongs to the ISRP_ASSESSMENT that discovered the gap. It may link to multiple affected assessment requirements and subjects. The parent request sees the finding through its assessment; no duplicate request-owned finding is created.
+
+REMEDIATION_CASE is the coordination aggregate for treatment. It can group one or more findings, including findings from more than one assessment when a single corrective program is justified. ISSUE_REFERENCE and CORRECTIVE_ACTION_PLAN belong to the remediation case.
 
 ## FINDING
 
@@ -1405,11 +1416,15 @@ title
 description
 severity
 status
+disposition
 owner_org_id
 owner_actor_id
 identified_at
 identified_by
 target_date
+resolved_at
+validated_at
+validated_by
 closed_at
 revision
 ~~~
@@ -1418,12 +1433,27 @@ Status:
 
 ~~~text
 OPEN
-REMEDIATION_PLANNED
-ACCEPTED_RISK
+AWAITING_DISPOSITION
+FIX_IN_PROGRESS
+PENDING_EXTERNAL_REGISTRATION
+EXTERNAL_REMEDIATION
+VALIDATION_PENDING
 RESOLVED
 CLOSED
 CANCELLED
 ~~~
+
+Disposition:
+
+~~~text
+UNDECIDED
+FIX_IN_ASSESSMENT
+REGISTER_NONCOMPLIANCE
+RISK_EXCEPTION
+NOT_A_FINDING
+~~~
+
+A finding cannot become RESOLVED or CLOSED merely because an external issue is resolved. ISRP validation must confirm the corrective result against current evidence and the linked requirements.
 
 ## FINDING_REQUIREMENT
 
@@ -1432,6 +1462,8 @@ finding_requirement_id
 finding_id
 assessment_requirement_id
 relationship_type
+created_at
+created_by
 ~~~
 
 Constraint:
@@ -1440,21 +1472,109 @@ Constraint:
 UNIQUE(finding_id, assessment_requirement_id)
 ~~~
 
+## FINDING_SUBJECT
+
+Links the finding to the impacted application, technology, vendor, product, or other scoped subject.
+
+~~~text
+finding_subject_id
+finding_id
+subject_id
+relationship_type
+created_at
+created_by
+~~~
+
+Constraint:
+
+~~~text
+UNIQUE(finding_id, subject_id, relationship_type)
+~~~
+
+## REMEDIATION_CASE
+
+Internal coordination record for treating one or more findings.
+
+~~~text
+remediation_case_id
+case_number
+title
+description
+status
+treatment_strategy
+owner_org_id
+owner_actor_id
+target_date
+validation_status
+validation_required_flag
+opened_at
+resolved_at
+closed_at
+revision
+~~~
+
+Status:
+
+~~~text
+OPEN
+PLANNING
+IN_PROGRESS
+EXTERNALLY_RESOLVED
+VALIDATION_PENDING
+RESOLVED
+CLOSED
+CANCELLED
+~~~
+
+Treatment strategy:
+
+~~~text
+FIX
+EXTERNAL_NONCOMPLIANCE
+RISK_EXCEPTION
+MIXED
+~~~
+
+## REMEDIATION_CASE_FINDING
+
+~~~text
+remediation_case_finding_id
+remediation_case_id
+finding_id
+relationship_type
+added_at
+added_by
+removed_at
+removed_by
+removal_reason
+~~~
+
+Active-row constraint:
+
+~~~text
+At most one active link for
+(remediation_case_id, finding_id, relationship_type)
+~~~
+
 ## ISSUE_REFERENCE
 
-External issue-management link.
+Reference to the authoritative record in an external issue-management system.
 
 ~~~text
 issue_reference_id
-finding_id
+remediation_case_id
 connector_name
 external_issue_id
+external_issue_key
 external_url
 synchronization_status
 last_observed_status
+last_observed_payload_json
 last_synchronized_at
 creation_idempotency_key
 created_at
+updated_at
+revision
 ~~~
 
 Constraints:
@@ -1464,7 +1584,118 @@ UNIQUE(connector_name, external_issue_id)
 UNIQUE(creation_idempotency_key)
 ~~~
 
-Issue creation and synchronization use the transactional outbox.
+ISRP stores a synchronized summary and link. The external issue-management platform remains authoritative for the issue's native lifecycle. Outbound creation uses the transactional outbox; inbound status updates use INTEGRATION_INBOX_EVENT.
+
+## CORRECTIVE_ACTION_PLAN
+
+A remediation case may have multiple plan versions, but at most one active approved plan.
+
+~~~text
+cap_id
+remediation_case_id
+plan_version
+status
+summary
+owner_org_id
+owner_actor_id
+proposed_at
+approved_at
+approved_by
+target_completion_date
+completed_at
+supersedes_cap_id
+revision
+~~~
+
+Status:
+
+~~~text
+DRAFT
+SUBMITTED
+APPROVED
+IN_PROGRESS
+COMPLETED
+SUPERSEDED
+CANCELLED
+~~~
+
+Constraints:
+
+~~~text
+UNIQUE(remediation_case_id, plan_version)
+At most one active APPROVED or IN_PROGRESS plan per remediation case
+~~~
+
+## CAP_ACTION_ITEM
+
+~~~text
+cap_action_item_id
+cap_id
+action_number
+title
+description
+status
+owner_org_id
+owner_actor_id
+target_date
+completed_at
+completion_summary
+revision
+~~~
+
+Status:
+
+~~~text
+NOT_STARTED
+IN_PROGRESS
+BLOCKED
+COMPLETED
+CANCELLED
+~~~
+
+## CAP_ACTION_FINDING
+
+~~~text
+cap_action_finding_id
+cap_action_item_id
+finding_id
+relationship_type
+~~~
+
+Constraint:
+
+~~~text
+UNIQUE(cap_action_item_id, finding_id)
+~~~
+
+## CAP_ACTION_REQUIREMENT
+
+~~~text
+cap_action_requirement_id
+cap_action_item_id
+assessment_requirement_id
+relationship_type
+~~~
+
+Constraint:
+
+~~~text
+UNIQUE(cap_action_item_id, assessment_requirement_id)
+~~~
+
+## CAP_EVIDENCE
+
+~~~text
+cap_evidence_id
+cap_id
+cap_action_item_id
+evidence_version_id
+relationship_type
+created_at
+created_by
+~~~
+
+CAP evidence references immutable EVIDENCE_VERSION records. cap_action_item_id may be null when evidence applies to the whole plan.
 
 ## RISK_EXCEPTION
 
@@ -1473,6 +1704,7 @@ exception_id
 assessment_id
 assessment_requirement_id
 finding_id
+remediation_case_id
 exception_type
 status
 rationale
@@ -1485,7 +1717,7 @@ expires_at
 supersedes_exception_id
 ~~~
 
-An exception does not change historical reviewer determinations. Policy determines its effect on final decision and closure.
+An exception does not change historical reviewer determinations. Policy determines its effect on final decision, finding treatment, remediation, and closure.
 
 # Part XI: Deterministic metadata proposals
 
@@ -1615,7 +1847,14 @@ REVIEWER_DETERMINATION_RECORDED
 FINAL_DECISION_RECORDED
 EXCEPTION_ACCEPTED
 FINDING_CREATED
+REMEDIATION_CASE_CREATED
+NONCOMPLIANCE_REGISTRATION_REQUESTED
 ISSUE_CREATED
+ISSUE_STATUS_SYNCHRONIZED
+CAP_APPROVED
+CAP_ACTION_COMPLETED
+REMEDIATION_VALIDATION_REQUESTED
+FINDING_VALIDATED
 ~~~
 
 ## COMMAND_DEDUPLICATION
@@ -1675,6 +1914,36 @@ UNIQUE(
 
 Business change, immutable history, audit event, and outbox event commit in one transaction.
 
+## INTEGRATION_INBOX_EVENT
+
+Durable receipt and processing state for an event received from an external provider or connector.
+
+~~~text
+inbox_event_id
+connector_name
+provider_event_id
+event_type
+received_at
+payload_json
+correlation_id
+processing_status
+attempt_count
+next_attempt_at
+claimed_by
+claimed_at
+processed_at
+last_error
+~~~
+
+Constraints:
+
+~~~text
+PRIMARY KEY(inbox_event_id)
+UNIQUE(connector_name, provider_event_id)
+~~~
+
+The raw receipt is persisted before domain handling. Processing is idempotent. If a provider has no event ID, the connector derives a stable deduplication key from provider identifiers and payload identity. Reconciliation uses the same command path as event delivery.
+
 ## PROCESSED_EVENT
 
 Consumer idempotency.
@@ -1719,7 +1988,10 @@ stale_evidence_count
 outdated_implementation_count
 
 open_finding_count
+active_remediation_case_count
 open_issue_count
+overdue_cap_action_count
+validation_pending_count
 
 source_version
 projected_at
@@ -1746,7 +2018,10 @@ not_applicable_requirement_count
 stale_evidence_count
 outdated_implementation_count
 open_finding_count
+active_remediation_case_count
 open_issue_count
+overdue_cap_action_count
+validation_pending_count
 
 active_work_package_count
 blocked_work_package_count
@@ -1793,7 +2068,7 @@ Authoritative child change
 
 Projection processing is idempotent and version-aware. Version gaps are delayed, replayed, or repaired through rebuild.
 
-Closure commands never rely solely on projections. They revalidate authoritative requirements, work packages, findings, issues, exceptions, and aggregate revisions.
+Closure commands never rely solely on projections. They revalidate authoritative requirements, work packages, findings, remediation cases, issue references, CAP actions, exceptions, validation state, and aggregate revisions.
 
 # Part XIV: Derived search, reporting, document, and vector models
 
@@ -2023,21 +2298,42 @@ BEGIN
 COMMIT
 ~~~
 
-## Issue creation
+## Finding disposition and external issue integration
 
 ~~~text
 BEGIN
-  create or update FINDING
-  insert ISSUE_CREATION_REQUESTED outbox event
+  lock FINDING and validate revision
+  record REGISTER_NONCOMPLIANCE disposition and justification
+  create or update REMEDIATION_CASE
+  link finding through REMEDIATION_CASE_FINDING
+  insert NONCOMPLIANCE_REGISTRATION_REQUESTED OUTBOX_EVENT
   insert AUDIT_EVENT
 COMMIT
 
-External connector:
+Outbound connector:
+  consume outbox event idempotently
   use creation_idempotency_key
-  create issue
-  record ISSUE_REFERENCE
-  emit synchronization event
+  create or locate external issue
+  record ISSUE_REFERENCE against REMEDIATION_CASE
+  emit ISSUE_CREATED or ISSUE_SYNCHRONIZATION_FAILED
 ~~~
+
+Inbound update:
+
+~~~text
+Connector webhook or reconciliation poll:
+  persist INTEGRATION_INBOX_EVENT using connector_name + provider_event_id
+  correlate ISSUE_REFERENCE
+  update synchronized issue summary and observed status
+  if external status is resolved:
+      mark remediation case EXTERNALLY_RESOLVED or VALIDATION_PENDING
+      create deterministic ISRP validation work
+      do not close finding
+  insert AUDIT_EVENT and OUTBOX_EVENT
+  mark inbox event processed
+~~~
+
+The external issue system remains authoritative for external issue and CAP execution states. ISRP is authoritative for finding disposition, requirement validation, and review closure.
 
 # Part XVII: Deletion, retention, and immutability
 
@@ -2112,7 +2408,15 @@ REQUIREMENT_COMMENT
 
 FINDING
 FINDING_REQUIREMENT
+FINDING_SUBJECT
+REMEDIATION_CASE
+REMEDIATION_CASE_FINDING
 ISSUE_REFERENCE
+CORRECTIVE_ACTION_PLAN
+CAP_ACTION_ITEM
+CAP_ACTION_FINDING
+CAP_ACTION_REQUIREMENT
+CAP_EVIDENCE
 RISK_EXCEPTION
 
 METADATA_CHANGE_PROPOSAL
@@ -2122,6 +2426,7 @@ PROPOSAL_DECISION
 COMMAND_DEDUPLICATION
 AUDIT_EVENT
 OUTBOX_EVENT
+INTEGRATION_INBOX_EVENT
 PROCESSED_EVENT
 
 REQUEST_STATUS_PROJECTION

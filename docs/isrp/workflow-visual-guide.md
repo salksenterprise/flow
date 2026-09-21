@@ -668,6 +668,139 @@ Active phases:
 
 The request lifecycle does not become WAITING_FOR_RESPONSE. That is an inner step state surfaced through the separate attention summary.
 
+## When review uncovers a requirement gap
+
+~~~text
+REVIEWER AND REQUESTOR CLARIFICATION LOOP
+                  |
+                  v
+        Requirement is not met
+                  |
+                  v
+        +---------------------+
+        | Create FINDING      |
+        | under ASSESSMENT    |
+        +----------+----------+
+                   |
+             Decide treatment
+                   |
+       +-----------+------------+----------------+
+       |                        |                |
+       v                        v                v
++---------------+    +--------------------+  +----------------+
+| Fix during    |    | Register external  |  | Risk exception |
+| assessment    |    | noncompliance      |  | path           |
++-------+-------+    +---------+----------+  +--------+-------+
+        |                      |                      |
+        v                      v                      v
+Change solution        REMEDIATION_CASE        Governed approval
+and submit evidence       |       |             and expiration
+        |                 |       |
+        v                 v       v
+Reviewer validates   ISSUE_REF   CAP
+        |                 |       |
+        +-----------------+-------+
+                          |
+                          v
+                  ISRP validation
+                          |
+                          v
+                 Resolve/close finding
+~~~
+
+The external system does not own the ISRP finding. It owns its issue record. ISRP owns the compliance gap, its requirement links, and the validation needed to close it.
+
+## Where each record belongs
+
+~~~text
+ISRP_REQUEST
+    |
+    +----< ISRP_ASSESSMENT
+              |
+              +----< ASSESSMENT_REQUIREMENT
+              |
+              +----< FINDING
+                       |
+                       +----< FINDING_REQUIREMENT
+                       |
+                       +----< FINDING_SUBJECT
+                       |
+                       +----< REMEDIATION_CASE_FINDING
+                                  |
+                                  v
+                           REMEDIATION_CASE
+                              |         |
+                              |         +----< ISSUE_REFERENCE
+                              |
+                              +----< CORRECTIVE_ACTION_PLAN
+                                          |
+                                          +----< CAP_ACTION_ITEM
+~~~
+
+Interpretation:
+
+~~~text
+Request
+  Business container; remediation totals are derived.
+
+Assessment
+  Owns the finding because this review discovered the gap.
+
+Finding
+  Describes the security gap and links affected requirements/subjects.
+
+Remediation case
+  Coordinates treatment; may group findings across assessments.
+
+External issue reference
+  Points to the authoritative issue-management record.
+
+Corrective action plan
+  Describes corrective work, owners, dates, actions, and evidence.
+~~~
+
+## External issue round trip
+
+~~~text
+ISRP                                      ISSUE MANAGEMENT
+
+Finding disposition
+REGISTER_NONCOMPLIANCE
+        |
+        v
+REMEDIATION_CASE
+        |
+        v
+OUTBOX_EVENT
+NONCOMPLIANCE_REGISTRATION_REQUESTED
+        | -------------------------------------> Create/find issue
+        |                                        idempotently
+        | <------------------------------------- Issue ID + status
+        v
+ISSUE_REFERENCE
+
+Later provider event
+        | <------------------------------------- Status = RESOLVED
+        v
+INTEGRATION_INBOX_EVENT
+(deduplicate and correlate)
+        |
+        v
+REMEDIATION_CASE = VALIDATION_PENDING
+        |
+        v
+Create ISRP validation work
+        |
+        v
+Authorized reviewer validates
+        |
+        +---- success ----> FINDING = RESOLVED/CLOSED
+        |
+        +---- failure ----> remediation continues
+~~~
+
+External RESOLVED means "ready for ISRP validation," not "finding closed."
+
 ## Database view
 
 ~~~text
@@ -688,6 +821,14 @@ ISRP_REQUEST
               +----< ASSESSMENT_REQUIREMENT
               |
               +----< REQUIREMENT_WORK_PACKAGE
+              |
+              +----< FINDING
+                       |
+                       +----< REMEDIATION_CASE_FINDING
+                                  |
+                                  +----> REMEDIATION_CASE
+                                            +----< ISSUE_REFERENCE
+                                            +----< CORRECTIVE_ACTION_PLAN
 ~~~
 
 Status propagation:

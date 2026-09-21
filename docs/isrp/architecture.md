@@ -18,7 +18,7 @@ Owns:
 - Requirement catalogs and applicability
 - Draft and submitted responses
 - Evidence references
-- Reviewer decisions, findings, and issue links
+- Reviewer decisions, findings, remediation cases, CAPs, and external issue references
 - Parent-child roll-up policy
 
 ### Workflow service
@@ -223,6 +223,72 @@ Compliance is represented by separate dimensions:
 The authoritative chain is responder assertion, reviewer determination, and final decision. One actor never overwrites another actor's conclusion. See [Flow to IS Requirements](requirements-catalog.md) for the complete model.
 
 
+
+## Gap, remediation, issue, and CAP ownership
+
+A gap is first recorded as a FINDING under the assessment that discovered it. The finding links to the affected ASSESSMENT_REQUIREMENT records and to the impacted subjects. It is not copied onto the request.
+
+The decision point is explicit:
+
+~~~text
+Finding
+  -> FIX_IN_ASSESSMENT
+       -> requestor changes solution
+       -> reviewer validates
+       -> finding may close
+  -> EXTERNALIZE
+       -> remediation case
+       -> external issue registration
+       -> corrective action plan
+       -> external resolution signal
+       -> ISRP validation
+       -> finding may close
+  -> RISK_EXCEPTION
+       -> governed exception
+       -> closure policy decides whether review may complete
+~~~
+
+REMEDIATION_CASE is the stable internal coordination aggregate. It can group one or more findings, including findings from separate assessments when they share one corrective program. ISSUE_REFERENCE and CORRECTIVE_ACTION_PLAN belong to the remediation case.
+
+The request relationship is derived:
+
+~~~text
+ISRP_REQUEST
+  -> ISRP_ASSESSMENT
+       -> FINDING
+            -> REMEDIATION_CASE_FINDING
+                 -> REMEDIATION_CASE
+                      -> ISSUE_REFERENCE
+                      -> CORRECTIVE_ACTION_PLAN
+~~~
+
+This avoids competing ownership at request and assessment level while still supporting request dashboards and closure checks.
+
+### External issue integration
+
+Outbound registration is asynchronous:
+
+~~~text
+ISRP transaction
+  -> save finding/remediation decision
+  -> OUTBOX_EVENT: NONCOMPLIANCE_REGISTRATION_REQUESTED
+  -> commit
+  -> connector creates or locates external issue idempotently
+~~~
+
+Inbound updates are also idempotent:
+
+~~~text
+Issue-management event or reconciliation poll
+  -> INTEGRATION_INBOX_EVENT
+  -> correlate connector + provider event ID
+  -> update ISSUE_REFERENCE observed state
+  -> create ISRP validation work when externally resolved
+  -> emit OUTBOX_EVENT for projections/workflow
+~~~
+
+The issue-management platform remains authoritative for its issue and plan execution state. ISRP retains the external identifiers, synchronized summary, timestamps, and audit trail. External RESOLVED never closes a finding automatically; an authorized reviewer must validate the corrective result against the requirement and evidence.
+
 ## RDBMS-first status projections
 
 The initial implementation keeps authoritative records, outbox events, and request/assessment status projections in the same PostgreSQL or Oracle database. A separate NoSQL or search store is not required.
@@ -233,7 +299,7 @@ Lifecycle status is authoritative and changes only through an authorized FSM tra
 - primary_phase and active phases: DAG execution summary
 - attention_status and reason: derived action or blocker
 - progress counts: derived child completion
-- compliance, evidence, finding, and issue counts: derived ISRP summary
+- compliance, evidence, finding, remediation, issue, CAP, and validation-pending counts: derived ISRP summary
 
 ~~~text
 Child business change
@@ -273,5 +339,8 @@ Requirement responses use different semantics:
 - Transitions validate the current revision before committing.
 - Business updates and outbox records commit in the same database transaction.
 - Consumers handle events idempotently.
-- Issue creation and external automation never run inside the primary database transaction.
+- External issue creation and updates never run inside the primary business transaction.
+- Outbound effects use OUTBOX_EVENT; inbound provider events use INTEGRATION_INBOX_EVENT.
+- Connector calls and inbound event handling are idempotent and reconcilable.
+- External issue resolution creates validation work and never closes a finding by itself.
 - Long-running work uses durable timers and retry policies.
