@@ -168,20 +168,28 @@ Acceptance:
 - Supervised AI output remains pending until an authorized supervisor acts.
 - Automation retries do not duplicate side effects.
 
-## Iteration 9: Parent-child projections
+## Iteration 9: RDBMS parent-child projections
 
 Deliver:
 
-- Request and assessment lifecycle, phase, attention, and progress projections
-- Priority-ordered roll-up rules
-- Projection version and timestamp
-- Administrative projection rebuild
+- Authoritative request and assessment lifecycle FSM state
+- Append-only request and assessment status-transition history
+- REQUEST_STATUS_PROJECTION and ASSESSMENT_STATUS_PROJECTION in the primary RDBMS
+- Normalized or JSON representation of simultaneous active phases
+- Outbox-driven status projector and PROCESSED_EVENT idempotency
+- Priority-ordered lifecycle, attention, progress, and compliance roll-up rules
+- Projection source version, timestamp, lag monitoring, and administrative rebuild
 - UI summaries and drill-down
+- Authoritative closure-policy validation
 
 Acceptance:
 
 - A child clarification changes attention without incorrectly resetting the parent lifecycle.
-- All completed required assessments make a request READY_TO_CLOSE.
+- All completed required assessments make a request READY_TO_CLOSE but do not automatically close it.
+- A request or assessment closure command validates authoritative children rather than trusting the projection alone.
+- Duplicate outbox delivery does not double-count status totals.
+- Out-of-order aggregate versions are detected and repaired or replayed.
+- Parallel review branches remain visible without forcing a misleading single current phase.
 - Rebuilding projections produces the same result as incremental processing.
 
 ## Iteration 10: Findings and issue integration

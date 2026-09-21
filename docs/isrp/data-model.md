@@ -228,21 +228,21 @@ The generic service maintains:
 
 Workflow records use opaque business_type, business_key, and correlation_id values instead of foreign keys into the ISRP database.
 
-## Parent projections
+## Request and assessment status projections
 
-Store lifecycle state separately from derived summaries:
+Lifecycle state remains on ISRP_REQUEST and ISRP_ASSESSMENT and changes only through their FSMs. Append-only REQUEST_STATUS_HISTORY and ASSESSMENT_STATUS_HISTORY record explicit transitions, reasons, actors, workflow correlation, and aggregate revisions.
 
-- lifecycle_status
-- current_phase
-- attention_status
-- attention_reason
-- completed_count
-- required_count
-- projection_version
+Derived summaries live in rebuildable relational tables:
 
-Parent projections update from child events. Recalculation must be idempotent and available as an administrative repair operation.
+- REQUEST_STATUS_PROJECTION
+- ASSESSMENT_STATUS_PROJECTION
+- optionally ASSESSMENT_ACTIVE_PHASE for normalized parallel phase state
 
-When ISRP and workflow use separate databases, parent summaries are eventually consistent. APIs should expose projection timestamps or versions where operationally useful.
+Projection fields include lifecycle status for convenient reads, primary and active phases, attention status and reason, required/completed counts, requirement outcome counts, evidence and implementation attention counts, work-package queues, findings, issues, source version, and projection timestamp.
+
+The status projector consumes OUTBOX_EVENT records, updates the assessment projection, then updates the parent request projection. PROCESSED_EVENT provides consumer-level idempotency. Recalculation is available as an administrative repair operation.
+
+When ISRP and Flow use separate databases, parent summaries are eventually consistent. APIs expose projection version and timestamp where useful. Closure, cancellation, reopening, and other controlled transitions revalidate authoritative records instead of relying solely on a projection. See [RDBMS status projections](status-projections.md).
 
 ## NoSQL and search projections
 

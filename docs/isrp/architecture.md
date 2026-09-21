@@ -214,6 +214,36 @@ Compliance is represented by separate dimensions:
 
 The authoritative chain is responder assertion, reviewer determination, and final decision. One actor never overwrites another actor's conclusion. See [Flow to IS Requirements](requirements-catalog.md) for the complete model.
 
+
+## RDBMS-first status projections
+
+The initial implementation keeps authoritative records, outbox events, and request/assessment status projections in the same PostgreSQL or Oracle database. A separate NoSQL or search store is not required.
+
+Lifecycle status is authoritative and changes only through an authorized FSM transition. Operational summaries are derived:
+
+- lifecycle_status: explicit request or assessment state
+- primary_phase and active phases: DAG execution summary
+- attention_status and reason: derived action or blocker
+- progress counts: derived child completion
+- compliance, evidence, finding, and issue counts: derived ISRP summary
+
+~~~text
+Child business change
+  -> authoritative history and current pointer
+  -> audit event
+  -> OUTBOX_EVENT
+  -> commit
+  -> status projector
+       -> ASSESSMENT_STATUS_PROJECTION
+       -> REQUEST_STATUS_PROJECTION
+~~~
+
+The projector is asynchronous and idempotent. Every consumer records processed event IDs and source versions. Projection lag is acceptable for dashboards, but lifecycle commands such as close, cancel, or reopen validate authoritative records rather than trusting a potentially delayed projection.
+
+A request becomes READY_TO_CLOSE only when required assessment conditions pass. CLOSED requires a separate authorized closure transition. An assessment similarly becomes READY_TO_COMPLETE from child conditions, while COMPLETED requires an explicit transition.
+
+Parallel DAG branches are represented by a primary phase plus normalized active-phase rows or a JSON phase summary. A single current phase must not conceal simultaneously active reviews. See [RDBMS status projections](status-projections.md).
+
 ## Editing and submission semantics
 
 Request and assessment metadata maintain a current editable representation. Updates use optimistic locking and overwrite current values, while audit events preserve who changed what and when.

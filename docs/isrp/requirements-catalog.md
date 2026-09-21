@@ -326,7 +326,7 @@ NOT_MET
   -> attention REMEDIATION_REQUIRED
 ~~~
 
-A child requirement change updates assessment projections. Assessment changes update request projections. Parent states summarize inner execution but do not mirror every child state.
+A child requirement change updates assessment projections. Assessment changes update request projections. Parent states summarize inner execution but do not mirror every child state. The initial implementation stores these projections in the same PostgreSQL or Oracle database and maintains them from OUTBOX_EVENT records. Controlled closure operations always revalidate authoritative child records. See [RDBMS status projections](status-projections.md).
 
 ## Transaction and audit invariants
 
