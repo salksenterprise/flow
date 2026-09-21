@@ -7,6 +7,7 @@ name = "flow-workflow-sqlite"
 version = "0.3.0"
 description = "SQLite persistence adapter for Flow"
 requires-python = ">=3.11"
+dependencies = ["flow-workflow-core"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

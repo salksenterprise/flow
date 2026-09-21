@@ -13,12 +13,16 @@ StepType = Literal[
 
 
 class ActorContext(BaseModel):
+    """What a client may say about itself: who it claims to be, nothing more.
+
+    Roles, groups and permissions are deliberately absent. Authority comes from
+    the trusted actor header the gateway injects, never from the request body,
+    and whatever arrives here is replaced before the engine sees it.
+    """
+
     actor_id: str
     actor_type: str = "USER"
     organization_id: str | None = None
-    roles: list[str] = Field(default_factory=list)
-    groups: list[str] = Field(default_factory=list)
-    permissions: list[str] = Field(default_factory=list)
 
 
 Actor = str | ActorContext
@@ -88,6 +92,28 @@ class StepAction(BaseModel):
     assignee_type: str = "USER"
     organization_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class RepairAction(BaseModel):
+    """A manual intervention. Permission and reason are both mandatory."""
+
+    command_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    action: Literal["skip_step", "force_complete_step", "retry_step", "reassign_step"]
+    actor: Actor = "api.user"
+    expected_revision: int | None = None
+    reason: str
+    assignee: str | None = None
+    assignee_type: str = "USER"
+    organization_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class VersionMigration(BaseModel):
+    command_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    target_version_id: int
+    actor: Actor = "api.user"
+    expected_revision: int | None = None
+    reason: str
 
 
 class WorkflowAction(BaseModel):

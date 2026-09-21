@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -9,7 +10,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .schema import INDEXES, SCHEMA, SCHEMA_VERSION
+from workflow_core.actor import Actor
+from workflow_core.errors import ConflictError
+
+from .schema import EVENT_SCHEMA_VERSION, INDEXES, SCHEMA, SCHEMA_VERSION
 
 
 DEFAULT_LIFECYCLE_FSM = {
@@ -62,7 +66,57 @@ DEFAULT_STEP_FSM = {
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """One timestamp format, matching the SQL default exactly.
+
+    Mixing isoformat() with SQLite's CURRENT_TIMESTAMP produced two shapes in
+    the same column, and due_at comparisons are string comparisons.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+# Every object Flow owns. A host embedding Flow may already have a table called
+# workflow_instance, so these names can be namespaced with a prefix.
+FLOW_TABLES = (
+    "fsm_definition", "fsm_version", "fsm_state_definition", "fsm_transition_definition",
+    "workflow_definition", "workflow_version", "step_definition", "transition_definition",
+    "workflow_instance", "workflow_subject", "workflow_fact_history", "step_instance",
+    "step_attempt", "work_assignment", "work_candidate", "signal_receipt",
+    "automation_job", "durable_timer", "workflow_event", "workflow_command",
+    "inbox_event", "outbox_event", "webhook_subscription", "outbox_delivery",
+    "schema_metadata",
+)
+# Longest first so that no name is a prefix of another match. A trailing word
+# boundary keeps workflow_instance_id from matching workflow_instance.
+_FLOW_OBJECT = re.compile(
+    r"\b(" + "|".join(sorted(FLOW_TABLES, key=len, reverse=True)) + r"|idx_\w+)\b")
+
+
+def apply_prefix(sql: str, prefix: str) -> str:
+    return sql if not prefix else _FLOW_OBJECT.sub(lambda m: prefix + m.group(0), sql)
+
+
+class _PrefixedConnection:
+    """Rewrites Flow's object names on the way to the database.
+
+    One choke point rather than a template in each of the hundred-odd inline
+    statements, and it works for a connection the host owns as readily as one
+    Flow opened.
+    """
+
+    __slots__ = ("_connection", "_prefix")
+
+    def __init__(self, connection: sqlite3.Connection, prefix: str):
+        self._connection = connection
+        self._prefix = prefix
+
+    def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+        return self._connection.execute(apply_prefix(sql, self._prefix), parameters)
+
+    def executescript(self, sql: str) -> sqlite3.Cursor:
+        return self._connection.executescript(apply_prefix(sql, self._prefix))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
 
 
 TERMINAL_PROJECTION = {"COMPLETED": "COMPLETED", "CANCELLED": "CANCELLED", "FAILED": "FAILED"}
@@ -91,14 +145,20 @@ def decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 class SQLiteWorkflowRepository:
-    def __init__(self, path: str | Path | None = None):
+    def __init__(self, path: str | Path | None = None, table_prefix: str = ""):
         """Standalone with a path; embedded with none.
 
         Embedded, the host binds its own connection with using(), and Flow
-        never opens, commits, rolls back or closes one.
+        never opens, commits, rolls back or closes one. A table_prefix
+        namespaces Flow's tables so they cannot collide with the host's.
         """
         self.path = str(path) if path is not None else None
+        self.table_prefix = table_prefix
         self._local = threading.local()
+
+    def _wrap(self, connection: sqlite3.Connection) -> Any:
+        return connection if not self.table_prefix else _PrefixedConnection(
+            connection, self.table_prefix)
 
     @property
     def _connection(self) -> sqlite3.Connection | None:
@@ -150,8 +210,9 @@ class SQLiteWorkflowRepository:
                 "create_schema cannot run inside an open transaction: DDL commits "
                 "implicitly and would commit the host's uncommitted work with it"
             )
+        wrapped = self._wrap(connection)
         legacy = self._legacy_database(connection)
-        connection.executescript(SCHEMA)
+        wrapped.executescript(SCHEMA)
         with self.using(connection):
             lifecycle_id = self._ensure_fsm(DEFAULT_LIFECYCLE_FSM, "WORKFLOW")
             step_id = self._ensure_fsm(DEFAULT_STEP_FSM, "STEP")
@@ -162,7 +223,7 @@ class SQLiteWorkflowRepository:
         connection.commit()
         # Indexes last: on a legacy database some of them reference columns the
         # migration has only just added.
-        connection.executescript(INDEXES)
+        wrapped.executescript(INDEXES)
         connection.commit()
 
     @contextmanager
@@ -184,11 +245,12 @@ class SQLiteWorkflowRepository:
             self._connection = None
             connection.row_factory = previous_factory
 
-    @staticmethod
-    def _legacy_database(connection: sqlite3.Connection) -> bool:
+    def _legacy_database(self, connection: sqlite3.Connection) -> bool:
         tables = {row[0] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        return "workflow_instance" in tables and "schema_metadata" not in tables
+        prefix = self.table_prefix
+        return (f"{prefix}workflow_instance" in tables
+                and f"{prefix}schema_metadata" not in tables)
 
     def _schema_version(self) -> int | None:
         row = self.db.execute(
@@ -199,7 +261,7 @@ class SQLiteWorkflowRepository:
         self.db.execute(
             """INSERT INTO schema_metadata(key,value) VALUES ('schema_version',?)
                ON CONFLICT(key) DO UPDATE SET value=excluded.value,
-               updated_at=CURRENT_TIMESTAMP""",
+               updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')""",
             (str(SCHEMA_VERSION),),
         )
 
@@ -231,6 +293,7 @@ class SQLiteWorkflowRepository:
                 ("organization_id", "TEXT"), ("assigned_by", "TEXT"), ("reason", "TEXT"),
                 ("created_at", "TEXT"), ("ended_at", "TEXT"),
             ],
+            "fsm_state_definition": [("category", "TEXT")],
             "workflow_event": [("actor_org_id", "TEXT")],
             "outbox_event": [
                 ("max_attempts", "INTEGER NOT NULL DEFAULT 10"),
@@ -268,15 +331,15 @@ class SQLiteWorkflowRepository:
                ELSE 'ACTIVE' END"""
         )
         self.db.execute(
-            "UPDATE outbox_event SET next_attempt_at=COALESCE(next_attempt_at,created_at,CURRENT_TIMESTAMP)"
+            "UPDATE outbox_event SET next_attempt_at=COALESCE(next_attempt_at,created_at,strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
         )
         self.db.execute("DROP INDEX IF EXISTS idx_outbox_status")
 
     @property
-    def db(self) -> sqlite3.Connection:
+    def db(self) -> Any:
         if self._connection is None:
             raise RuntimeError("Repository operation requires a transaction")
-        return self._connection
+        return self._wrap(self._connection)
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -318,14 +381,15 @@ class SQLiteWorkflowRepository:
             return row["id"]
         version_id = self.db.execute(
             """INSERT INTO fsm_version(definition_id,version_number,status,initial_state,published_at)
-               VALUES (?,?,?,?,CURRENT_TIMESTAMP)""",
+               VALUES (?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))""",
             (definition_id, version, "PUBLISHED", spec["initial_state"]),
         ).lastrowid
         for state in spec["states"]:
             state = {"key": state} if isinstance(state, str) else state
             self.db.execute(
-                "INSERT INTO fsm_state_definition(fsm_version_id,state_key,terminal) VALUES (?,?,?)",
-                (version_id, state["key"], bool(state.get("terminal"))),
+                """INSERT INTO fsm_state_definition(fsm_version_id,state_key,terminal,category)
+                   VALUES (?,?,?,?)""",
+                (version_id, state["key"], bool(state.get("terminal")), state.get("category")),
             )
         for transition in spec["transitions"]:
             self.db.execute(
@@ -359,12 +423,14 @@ class SQLiteWorkflowRepository:
             "SELECT 1 FROM workflow_version WHERE definition_id=? AND version_number=?",
             (definition_id, version),
         ).fetchone():
-            raise ValueError("That workflow version already exists")
+            raise ConflictError(
+                f"Version {version} of workflow '{data['key']}' already exists. "
+                "Published versions are immutable; publish a new version number.")
         status = "PUBLISHED" if data.get("publish", True) else "DRAFT"
         version_id = self.db.execute(
             """INSERT INTO workflow_version
                (definition_id,version_number,status,lifecycle_fsm_version_id,published_at)
-               VALUES (?,?,?,?,CASE WHEN ?='PUBLISHED' THEN CURRENT_TIMESTAMP END)""",
+               VALUES (?,?,?,?,CASE WHEN ?='PUBLISHED' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') END)""",
             (definition_id, version, status, lifecycle_id, status),
         ).lastrowid
         default_step_id = self._ensure_fsm(DEFAULT_STEP_FSM, "STEP")
@@ -436,20 +502,43 @@ class SQLiteWorkflowRepository:
         ).fetchone())
 
     def state_is_terminal(self, fsm_version_id: int, state: str) -> bool:
+        return bool(self.state_meta(fsm_version_id, state)["terminal"])
+
+    def state_meta(self, fsm_version_id: int, state: str) -> dict[str, Any]:
+        """Whether a state is terminal, and the execution category it declares.
+
+        A null category means the definition did not declare one; the engine
+        resolves it. Storing the declaration rather than a guess is what stops
+        execution status being inferred from state names.
+        """
         row = self.db.execute(
-            "SELECT terminal FROM fsm_state_definition WHERE fsm_version_id=? AND state_key=?",
+            """SELECT terminal,category FROM fsm_state_definition
+               WHERE fsm_version_id=? AND state_key=?""",
             (fsm_version_id, state),
         ).fetchone()
-        return bool(row and row[0])
+        if row is None:
+            return {"terminal": False, "category": None}
+        return {"terminal": bool(row["terminal"]), "category": row["category"]}
 
     def command_result(self, command_id: str) -> dict[str, Any] | None:
-        row = self.db.execute("SELECT result_json FROM workflow_command WHERE command_id=?", (command_id,)).fetchone()
+        """The receipt for a command already applied, or None.
+
+        A receipt records which workflow the command hit and the revision it
+        produced. It deliberately does not hold a copy of the workflow: storing
+        a full snapshot per command made command storage grow with the square
+        of the number of commands.
+        """
+        row = self.db.execute(
+            "SELECT result_json FROM workflow_command WHERE command_id=?", (command_id,)
+        ).fetchone()
         return json.loads(row[0]) if row else None
 
-    def record_command(self, command_id: str, workflow_id: int, action: str, result: dict[str, Any]) -> None:
+    def record_command(self, command_id: str, workflow_id: int, action: str,
+                       revision: int | None = None) -> None:
+        receipt = {"workflow_instance_id": workflow_id, "action": action, "revision": revision}
         self.db.execute(
             "INSERT INTO workflow_command(command_id,workflow_instance_id,action,result_json) VALUES (?,?,?,?)",
-            (command_id, workflow_id, action, json.dumps(result)),
+            (command_id, workflow_id, action, json.dumps(receipt)),
         )
 
     def create_workflow(self, data: dict[str, Any], version: dict[str, Any]) -> int:
@@ -465,7 +554,8 @@ class SQLiteWorkflowRepository:
             (data["workflow_version_id"], data["title"], data.get("business_type"), data.get("business_key"),
              data.get("correlation_id"), lifecycle, json.dumps(data.get("variables", {})), parent_id,
              root_id, data.get("parent_step_instance_id"), data.get("relationship_type"),
-             data.get("relationship_key"), bool(data.get("required", True)), data.get("actor", "system")),
+             data.get("relationship_key"), bool(data.get("required", True)),
+             Actor.from_value(data.get("actor", "system")).actor_id),
         ).lastrowid
         if root_id is None:
             resolved_root = workflow_id
@@ -500,6 +590,52 @@ class SQLiteWorkflowRepository:
                    (workflow_instance_id,step_definition_id,state,execution_status)
                    VALUES (?,?,?,'NOT_READY')""", (workflow_id, row["id"], initial),
             )
+
+    def fsm_has_state(self, fsm_version_id: int, state: str) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM fsm_state_definition WHERE fsm_version_id=? AND state_key=?",
+            (fsm_version_id, state),
+        ).fetchone() is not None
+
+    def remap_step_instances(self, workflow_id: int, target_version_id: int) -> dict[str, int]:
+        """Repoint a workflow's nodes at another version's definitions, by step key.
+
+        Step key is the identity that survives a version change: node ids do
+        not, and node order certainly does not. A node whose key exists in both
+        versions keeps its state; one that has been removed is retired; one
+        that is new starts unready.
+        """
+        current = {row["step_key"]: dict(row) for row in self.db.execute(
+            """SELECT si.id,si.execution_status,sd.step_key
+               FROM step_instance si JOIN step_definition sd ON sd.id=si.step_definition_id
+               WHERE si.workflow_instance_id=?""", (workflow_id,))}
+        target = {row["step_key"]: dict(row) for row in self.db.execute(
+            """SELECT id,step_key,step_fsm_version_id FROM step_definition
+               WHERE workflow_version_id=?""", (target_version_id,))}
+
+        summary = {"kept": 0, "added": 0, "retired": 0}
+        placeholders = ",".join("?" * len(TERMINAL_STEP_EXECUTION))
+        for key, row in current.items():
+            if key in target:
+                self.db.execute(
+                    "UPDATE step_instance SET step_definition_id=? WHERE id=?",
+                    (target[key]["id"], row["id"]))
+                summary["kept"] += 1
+            else:
+                self.db.execute(
+                    f"""UPDATE step_instance SET execution_status='CANCELLED',completed_at=?
+                        WHERE id=? AND execution_status NOT IN ({placeholders})""",
+                    (utcnow(), row["id"], *TERMINAL_STEP_EXECUTION))
+                summary["retired"] += 1
+        for key, row in target.items():
+            if key not in current:
+                self.db.execute(
+                    """INSERT INTO step_instance
+                       (workflow_instance_id,step_definition_id,state,execution_status)
+                       VALUES (?,?,?,'NOT_READY')""",
+                    (workflow_id, row["id"], self.fsm_initial_state(row["step_fsm_version_id"])))
+                summary["added"] += 1
+        return summary
 
     def get_instance_row(self, workflow_id: int) -> dict[str, Any] | None:
         return decode(self.db.execute("SELECT * FROM workflow_instance WHERE id=?", (workflow_id,)).fetchone())
@@ -566,7 +702,7 @@ class SQLiteWorkflowRepository:
 
     def list_steps_by_execution(self, workflow_id: int, status: str) -> list[dict[str, Any]]:
         return [decode(row) for row in self.db.execute(
-            """SELECT si.*,sd.step_type,sd.stage,sd.assignment_role,sd.join_rule,
+            """SELECT si.*,sd.step_key,sd.step_type,sd.stage,sd.assignment_role,sd.join_rule,
                sd.step_fsm_version_id,sd.configuration_json
                FROM step_instance si JOIN step_definition sd ON sd.id=si.step_definition_id
                WHERE si.workflow_instance_id=? AND si.execution_status=?""", (workflow_id, status),
@@ -574,9 +710,12 @@ class SQLiteWorkflowRepository:
 
     def incoming(self, workflow_id: int, step_definition_id: int) -> list[dict[str, Any]]:
         return [decode(row) for row in self.db.execute(
-            """SELECT td.condition_json,pred.execution_status,pred.state,pred.id step_instance_id
-               FROM transition_definition td JOIN step_instance pred
-               ON pred.step_definition_id=td.from_step_id AND pred.workflow_instance_id=?
+            """SELECT td.condition_json,pred.execution_status,pred.state,
+                      pred.id step_instance_id,sd.configuration_json
+               FROM transition_definition td
+               JOIN step_instance pred
+                 ON pred.step_definition_id=td.from_step_id AND pred.workflow_instance_id=?
+               JOIN step_definition sd ON sd.id=td.from_step_id
                WHERE td.to_step_id=?""", (workflow_id, step_definition_id),
         )]
 
@@ -642,19 +781,19 @@ class SQLiteWorkflowRepository:
 
     def create_assignment(self, step_id: int, assignee_type: str, assignee: str,
                           organization_id: str | None = None, assigned_by: str | None = None,
-                          reason: str | None = None) -> None:
+                          reason: str | None = None, due_at: str | None = None) -> None:
         self.db.execute(
             """INSERT INTO work_assignment
-               (step_instance_id,assignee_type,assignee,organization_id,assigned_by,reason)
-               VALUES (?,?,?,?,?,?)""",
-            (step_id, assignee_type, assignee, organization_id, assigned_by, reason),
+               (step_instance_id,assignee_type,assignee,organization_id,assigned_by,reason,due_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (step_id, assignee_type, assignee, organization_id, assigned_by, reason, due_at),
         )
 
     def replace_assignments(self, step_id: int, assignee_type: str, assignee: str,
                             organization_id: str | None = None, assigned_by: str | None = None,
                             reason: str | None = None) -> None:
         self.db.execute(
-            """UPDATE work_assignment SET status='REPLACED',ended_at=CURRENT_TIMESTAMP
+            """UPDATE work_assignment SET status='REPLACED',ended_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                WHERE step_instance_id=? AND status='OPEN'""", (step_id,),
         )
         self.create_assignment(step_id, assignee_type, assignee, organization_id, assigned_by, reason)
@@ -667,7 +806,7 @@ class SQLiteWorkflowRepository:
 
     def record_attempt_end(self, step_id: int, iteration: int, outcome: str, result: dict[str, Any]) -> None:
         self.db.execute(
-            """UPDATE step_attempt SET completed_at=CURRENT_TIMESTAMP,outcome=?,result_json=?
+            """UPDATE step_attempt SET completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),outcome=?,result_json=?
                WHERE step_instance_id=? AND iteration_number=?""",
             (outcome, json.dumps(result), step_id, iteration),
         )
@@ -699,7 +838,7 @@ class SQLiteWorkflowRepository:
     def mark_inbox_processed(self, inbox_id: int, error: str | None = None) -> None:
         self.db.execute(
             """UPDATE inbox_event SET status=?,attempts=attempts+1,
-               processed_at=CASE WHEN ? IS NULL THEN CURRENT_TIMESTAMP ELSE processed_at END,
+               processed_at=CASE WHEN ? IS NULL THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE processed_at END,
                last_error=? WHERE id=?""",
             ("PROCESSED" if error is None else "FAILED", error, error, inbox_id),
         )
@@ -714,7 +853,7 @@ class SQLiteWorkflowRepository:
 
     def consume_signal(self, signal_id: int, step_id: int) -> None:
         self.db.execute(
-            """UPDATE signal_receipt SET consumed_at=CURRENT_TIMESTAMP,consumed_step_instance_id=?
+            """UPDATE signal_receipt SET consumed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),consumed_step_instance_id=?
                WHERE id=? AND consumed_at IS NULL""", (step_id, signal_id),
         )
 
@@ -773,15 +912,21 @@ class SQLiteWorkflowRepository:
         sql = ",".join(f"{key}=?" for key in values)
         self.db.execute(f"UPDATE automation_job SET {sql} WHERE id=?", (*values.values(), job_id))
 
-    def create_timer(self, workflow_id: int, step: dict[str, Any]) -> None:
+    def create_timer(self, workflow_id: int, step: dict[str, Any], due_at: str,
+                     action: str = "COMPLETE_STEP") -> None:
+        """A durable timer for a node.
+
+        The due time is computed by the engine, which owns the business
+        calendar. The key includes the action so that a node can carry both a
+        delay timer and a service-level timer for the same iteration.
+        """
         config = step.get("configuration", {})
-        seconds = int(config.get("delay_seconds", 0))
-        due = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
         self.db.execute(
             """INSERT OR IGNORE INTO durable_timer
                (timer_key,workflow_instance_id,step_instance_id,timer_type,action,due_at,payload_json)
-               VALUES (?,?,?,'RELATIVE','COMPLETE_STEP',?,?)""",
-            (f"{workflow_id}:{step['id']}:{step['iteration_number']}", workflow_id, step["id"], due,
+               VALUES (?,?,?,'RELATIVE',?,?,?)""",
+            (f"{workflow_id}:{step['id']}:{step['iteration_number']}:{action}",
+             workflow_id, step["id"], action, due_at,
              json.dumps(config.get("payload", {}))),
         )
 
@@ -839,7 +984,7 @@ class SQLiteWorkflowRepository:
 
     def fire_timer(self, timer_id: int) -> None:
         self.db.execute(
-            "UPDATE durable_timer SET status='FIRED',fired_at=CURRENT_TIMESTAMP WHERE id=? AND status='SCHEDULED'",
+            "UPDATE durable_timer SET status='FIRED',fired_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status='SCHEDULED'",
             (timer_id,),
         )
 
@@ -857,6 +1002,7 @@ class SQLiteWorkflowRepository:
             (workflow_id,),
         ).fetchone()
         event_payload = {
+            "schema_version": EVENT_SCHEMA_VERSION,
             "event_id": event_id, "event_type": event_type, "workflow_instance_id": workflow_id,
             "step_instance_id": step_id, "sequence_number": sequence, "actor": actor,
             "actor_org_id": actor_org_id, "previous_state": previous, "new_state": new,
@@ -875,6 +1021,152 @@ class SQLiteWorkflowRepository:
                VALUES (?,?,?,?)""",
             (event_id, event_type, json.dumps(event_payload), utcnow()),
         )
+
+    def list_work(self, assignee: str | None = None, actor: dict[str, Any] | None = None,
+                  execution_status: str | None = None, step_type: str | None = None,
+                  business_type: str | None = None, business_key: str | None = None,
+                  workflow_id: int | None = None,
+                  limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Open work, filtered and paginated.
+
+        Without this a client had to fetch whole workflows and sift them, which
+        is why the console could not show anyone their own queue.
+
+        `assignee` matches an open assignment. `actor` matches the candidate
+        rules instead, answering 'what could this person claim' rather than
+        'what is already theirs'.
+        """
+        clauses = ["si.execution_status IN ('READY','ACTIVE','WAITING')"]
+        args: list[Any] = []
+        if assignee:
+            clauses.append("""EXISTS (SELECT 1 FROM work_assignment a
+                WHERE a.step_instance_id=si.id AND a.status='OPEN' AND a.assignee=?)""")
+            args.append(assignee)
+        if actor:
+            memberships = sorted(set(actor.get("roles") or ()) | set(actor.get("groups") or ()))
+            placeholders = ",".join("?" * len(memberships)) or "NULL"
+            clauses.append(f"""EXISTS (SELECT 1 FROM work_candidate c
+                WHERE c.step_instance_id=si.id
+                  AND (c.organization_id IS NULL OR c.organization_id=?)
+                  AND ((c.candidate_type='USER' AND c.candidate_value=?)
+                       OR (c.candidate_type IN ('ROLE','GROUP') AND c.candidate_value IN ({placeholders}))
+                       OR (c.candidate_type='ORGANIZATION' AND c.candidate_value=?)))""")
+            args.extend([actor.get("organization_id"), actor.get("actor_id"),
+                         *memberships, actor.get("organization_id")])
+        for column, value in (("si.execution_status", execution_status),
+                              ("sd.step_type", step_type),
+                              ("w.business_type", business_type),
+                              ("w.business_key", business_key),
+                              ("w.id", workflow_id)):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                args.append(value)
+        where = " AND ".join(clauses)
+        source = """FROM step_instance si
+                    JOIN step_definition sd ON sd.id=si.step_definition_id
+                    JOIN workflow_instance w ON w.id=si.workflow_instance_id"""
+        with self.transaction():
+            total = int(self.db.execute(
+                f"SELECT COUNT(*) {source} WHERE {where}", args).fetchone()[0])
+            rows = [decode(row) for row in self.db.execute(
+                f"""SELECT si.id step_instance_id,si.state,si.execution_status,
+                           si.iteration_number,si.activated_at,si.started_at,
+                           sd.step_key,sd.name,sd.step_type,sd.stage,sd.assignment_role,
+                           w.id workflow_instance_id,w.title,w.business_type,
+                           w.business_key,w.correlation_id,w.lifecycle_state
+                    {source} WHERE {where}
+                    ORDER BY si.activated_at,si.id LIMIT ? OFFSET ?""",
+                (*args, limit, offset))]
+            for row in rows:
+                row["assignments"] = [decode(item) for item in self.db.execute(
+                    """SELECT assignee_type,assignee,organization_id,status
+                       FROM work_assignment WHERE step_instance_id=? AND status='OPEN'""",
+                    (row["step_instance_id"],))]
+        return {"items": rows, "total": total, "limit": limit, "offset": offset}
+
+    def stuck_workflows(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Running workflows with nothing that can advance them.
+
+        No node ready, active or waiting; no job queued or running; no timer
+        scheduled. Such a workflow is not slow, it is wedged, and nothing else
+        in the system will say so.
+        """
+        with self.transaction():
+            return [decode(row) for row in self.db.execute(
+                """SELECT w.id,w.title,w.business_type,w.business_key,w.correlation_id,
+                          w.current_stage,w.lifecycle_state,w.created_at
+                   FROM workflow_instance w
+                   WHERE w.execution_status='RUNNING'
+                     AND NOT EXISTS (SELECT 1 FROM step_instance s
+                         WHERE s.workflow_instance_id=w.id
+                           AND s.execution_status IN ('READY','ACTIVE','WAITING'))
+                     AND NOT EXISTS (SELECT 1 FROM automation_job j
+                         WHERE j.workflow_instance_id=w.id
+                           AND j.status IN ('QUEUED','RETRY_WAIT','RUNNING'))
+                     AND NOT EXISTS (SELECT 1 FROM durable_timer t
+                         WHERE t.workflow_instance_id=w.id AND t.status='SCHEDULED')
+                   ORDER BY w.id LIMIT ?""", (limit,),
+            )]
+
+    def dead_letter_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.transaction():
+            return [decode(row) for row in self.db.execute(
+                """SELECT id,event_id,event_type,attempts,max_attempts,last_error,created_at
+                   FROM outbox_event WHERE status='DEAD_LETTER' ORDER BY id LIMIT ?""",
+                (limit,),
+            )]
+
+    def redrive_outbox(self, outbox_id: int) -> bool:
+        """Return a dead-lettered event to the delivery queue."""
+        with self.transaction():
+            changed = self.db.execute(
+                """UPDATE outbox_event SET status='PENDING',attempts=0,next_attempt_at=?,
+                   claimed_by=NULL,claimed_at=NULL WHERE id=? AND status='DEAD_LETTER'""",
+                (utcnow(), outbox_id),
+            )
+            return changed.rowcount == 1
+
+    def operational_counters(self) -> dict[str, int]:
+        """Counters an operator needs before anything is on fire."""
+        with self.transaction():
+            def scalar(sql: str, *args: Any) -> int:
+                return int(self.db.execute(sql, args).fetchone()[0] or 0)
+
+            now = utcnow()
+            return {
+                "workflows_running": scalar(
+                    "SELECT COUNT(*) FROM workflow_instance WHERE execution_status='RUNNING'"),
+                "workflows_suspended": scalar(
+                    "SELECT COUNT(*) FROM workflow_instance WHERE execution_status='SUSPENDED'"),
+                "workflows_failed": scalar(
+                    "SELECT COUNT(*) FROM workflow_instance WHERE execution_status='FAILED'"),
+                "workflows_stuck": len(self.stuck_workflows(limit=1000)),
+                "jobs_queued": scalar(
+                    "SELECT COUNT(*) FROM automation_job WHERE status IN ('QUEUED','RETRY_WAIT')"),
+                "jobs_running": scalar(
+                    "SELECT COUNT(*) FROM automation_job WHERE status='RUNNING'"),
+                "jobs_lease_expired": scalar(
+                    "SELECT COUNT(*) FROM automation_job WHERE status='RUNNING' AND lease_expires_at<?",
+                    now),
+                "timers_due": scalar(
+                    "SELECT COUNT(*) FROM durable_timer WHERE status='SCHEDULED' AND due_at<=?", now),
+                "outbox_pending": scalar(
+                    "SELECT COUNT(*) FROM outbox_event WHERE status IN ('PENDING','CLAIMED')"),
+                "outbox_dead_letter": scalar(
+                    "SELECT COUNT(*) FROM outbox_event WHERE status='DEAD_LETTER'"),
+                "inbox_failed": scalar(
+                    "SELECT COUNT(*) FROM inbox_event WHERE status='FAILED'"),
+            }
+
+    def requeue_job_for_step(self, step_id: int) -> bool:
+        """Put a step's automation job back on the queue with fresh attempts."""
+        changed = self.db.execute(
+            """UPDATE automation_job SET status='QUEUED',attempt_count=0,available_at=?,
+               claimed_by=NULL,claimed_at=NULL,lease_expires_at=NULL,completed_at=NULL
+               WHERE step_instance_id=?""",
+            (utcnow(), step_id),
+        )
+        return changed.rowcount > 0
 
     def create_subscription(self, data: dict[str, Any]) -> dict[str, Any]:
         with self.transaction():
@@ -936,14 +1228,14 @@ class SQLiteWorkflowRepository:
             if existing:
                 self.db.execute(
                     """UPDATE outbox_delivery SET status=?,attempts=?,last_error=?,
-                       delivered_at=CASE WHEN ? THEN CURRENT_TIMESTAMP END WHERE id=?""",
+                       delivered_at=CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') END WHERE id=?""",
                     (status, existing["attempts"] + 1, error, delivered, existing["id"]),
                 )
             else:
                 self.db.execute(
                     """INSERT INTO outbox_delivery
                        (outbox_event_id,subscription_id,status,attempts,last_error,delivered_at)
-                       VALUES (?,?,?,?,?,CASE WHEN ? THEN CURRENT_TIMESTAMP END)""",
+                       VALUES (?,?,?,?,?,CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') END)""",
                     (outbox_id, subscription_id, status, 1, error, delivered),
                 )
 
@@ -955,7 +1247,7 @@ class SQLiteWorkflowRepository:
             attempts = row["attempts"] + 1
             if delivered:
                 self.db.execute(
-                    """UPDATE outbox_event SET status='DELIVERED',attempts=?,processed_at=CURRENT_TIMESTAMP,
+                    """UPDATE outbox_event SET status='DELIVERED',attempts=?,processed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
                        claimed_by=NULL,claimed_at=NULL,last_error=NULL WHERE id=?""", (attempts, outbox_id),
                 )
             elif attempts >= row["max_attempts"]:

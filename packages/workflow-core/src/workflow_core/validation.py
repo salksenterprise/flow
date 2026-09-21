@@ -3,6 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import ValidationError
+from .rules import validate_rule
+from .calendars import validate_calendar
+from .states import (
+    BREACH_ACTIONS, CHILD_FAILURE_POLICIES, FAILURE_POLICIES, STATE_CATEGORIES,
+)
 
 
 STEP_TYPES = {
@@ -16,6 +21,13 @@ def validate_fsm(spec: dict[str, Any], label: str) -> None:
     states = [item if isinstance(item, str) else item.get("key") for item in spec.get("states", [])]
     if not states or None in states or len(states) != len(set(states)):
         raise ValidationError(f"{label} states must be present and unique")
+    for item in spec.get("states", []):
+        category = item.get("category") if isinstance(item, dict) else None
+        if category is not None and category not in STATE_CATEGORIES:
+            raise ValidationError(
+                f"{label} state '{item.get('key')}' declares unknown category "
+                f"'{category}'. Supported: {', '.join(sorted(STATE_CATEGORIES))}"
+            )
     if spec.get("initial_state") not in states:
         raise ValidationError(f"{label} initial_state must name a defined state")
     seen: set[tuple[str, str]] = set()
@@ -23,6 +35,7 @@ def validate_fsm(spec: dict[str, Any], label: str) -> None:
         source, target, action = transition.get("from"), transition.get("to"), transition.get("action")
         if source not in states or target not in states or not action:
             raise ValidationError(f"{label} has an invalid transition")
+        validate_rule(transition.get("guard"), f"{label} guard on {source}/{action}")
         key = (source, action)
         if key in seen:
             raise ValidationError(f"{label} has duplicate transition {source}/{action}")
@@ -56,6 +69,34 @@ def validate_template(template: dict[str, Any]) -> None:
             raise ValidationError(f"TIMER step '{step['key']}' requires configuration.delay_seconds")
         if step.get("fsm"):
             validate_fsm(step["fsm"], f"Step FSM '{step['key']}'")
+        configuration = step.get("configuration", {})
+        on_failure = configuration.get("on_failure")
+        if on_failure is not None and on_failure not in FAILURE_POLICIES:
+            raise ValidationError(
+                f"Step '{step['key']}' declares unknown on_failure '{on_failure}'. "
+                f"Supported: {', '.join(sorted(FAILURE_POLICIES))}")
+        child_policy = configuration.get("child_failure_policy")
+        if child_policy is not None and child_policy not in CHILD_FAILURE_POLICIES:
+            raise ValidationError(
+                f"Step '{step['key']}' declares unknown child_failure_policy "
+                f"'{child_policy}'. Supported: {', '.join(sorted(CHILD_FAILURE_POLICIES))}")
+        validate_calendar(configuration.get("calendar"), f"Step '{step['key']}' calendar")
+        due = configuration.get("due_in_seconds")
+        if due is not None and (not isinstance(due, int) or isinstance(due, bool) or due <= 0):
+            raise ValidationError(
+                f"Step '{step['key']}' due_in_seconds must be a positive whole number")
+        breach = configuration.get("on_breach")
+        if breach is not None and breach not in BREACH_ACTIONS:
+            raise ValidationError(
+                f"Step '{step['key']}' declares unknown on_breach '{breach}'. "
+                f"Supported: {', '.join(sorted(BREACH_ACTIONS))}")
+        if breach == "ESCALATE" and not configuration.get("escalate_to"):
+            raise ValidationError(
+                f"Step '{step['key']}' sets on_breach ESCALATE without an escalate_to")
+        for candidate in step.get("configuration", {}).get("candidates", []):
+            if not candidate.get("type") or not candidate.get("value"):
+                raise ValidationError(
+                    f"Step '{step['key']}' has a candidate without a type and value")
     edge_keys: set[tuple[str, str]] = set()
     for edge in transitions:
         source, destination = edge.get("from_step"), edge.get("to_step")
@@ -63,6 +104,7 @@ def validate_template(template: dict[str, Any]) -> None:
             raise ValidationError(f"Unknown transition endpoint: {source} -> {destination}")
         if (source, destination) in edge_keys:
             raise ValidationError(f"Duplicate transition: {source} -> {destination}")
+        validate_rule(edge.get("condition"), f"Condition on {source} -> {destination}")
         if by_key[source]["type"] == "END":
             raise ValidationError(f"END step '{source}' cannot have outgoing transitions")
         edge_keys.add((source, destination))

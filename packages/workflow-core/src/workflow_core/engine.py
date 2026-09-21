@@ -3,34 +3,47 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .errors import ConflictError, NotFoundError, ValidationError
+from .actor import Actor
+from .calendars import deadline
+from .errors import ConflictError, ExecutionError, NotFoundError, ValidationError
 from .ports import WorkflowRepository
 from .rules import evaluate
+from .states import (
+    SATISFIED_EXECUTION, TERMINAL_EXECUTION, resolve_category,
+)
 from .validation import validate_template
 
 
-SATISFIED_EXECUTION = {"COMPLETED", "SKIPPED"}
-TERMINAL_EXECUTION = {"COMPLETED", "SKIPPED", "FAILED", "CANCELLED"}
 IMMEDIATE_TYPES = {"FORK", "JOIN", "MILESTONE"}
+
+# The driver runs to a fixed point. The bound turns a definition that
+# oscillates into a reported error rather than a hung transaction.
+DRIVER_ITERATION_LIMIT = 200
+
+
+def stamp(moment: datetime) -> str:
+    """One timestamp format; see workflow_sqlite.utcnow."""
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return stamp(datetime.now(timezone.utc))
+
+
+def actor_of(command: dict[str, Any]) -> Actor:
+    return Actor.from_value(command.get("actor", "system"))
 
 
 def actor_id(command: dict[str, Any]) -> str:
-    actor = command.get("actor", "system")
-    return actor.get("actor_id", "system") if isinstance(actor, dict) else actor
+    return actor_of(command).actor_id
 
 
 def actor_org(command: dict[str, Any]) -> str | None:
-    actor = command.get("actor")
-    return actor.get("organization_id") if isinstance(actor, dict) else None
+    return actor_of(command).organization_id
 
 
-def actor_permissions(command: dict[str, Any]) -> set[str]:
-    actor = command.get("actor")
-    return set(actor.get("permissions", [])) if isinstance(actor, dict) else set()
+def actor_permissions(command: dict[str, Any]) -> frozenset[str]:
+    return actor_of(command).permissions
 
 
 class WorkflowEngine:
@@ -60,6 +73,173 @@ class WorkflowEngine:
             raise NotFoundError("Workflow instance not found")
         return result
 
+    def _replay(self, command_id: str) -> dict[str, Any] | None:
+        """The current workflow for a command already applied, or None.
+
+        A repeated command has one effect, and the caller is handed the
+        workflow as it stands now. Flow stores a receipt rather than a frozen
+        copy of the response, so a replay reflects reality rather than a
+        snapshot that may be many revisions stale.
+        """
+        receipt = self.repository.command_result(command_id)
+        if not receipt:
+            return None
+        return self.get_workflow(receipt["workflow_instance_id"])
+
+    def migrate_workflow_version(self, workflow_id: int, command: dict[str, Any]) -> dict[str, Any]:
+        """Move a running instance onto another published version of its definition.
+
+        The policy is deliberately narrow, because a silent remapping of
+        in-flight work is worse than a refusal:
+
+        1. It is an explicit, permissioned, reasoned command. Nothing migrates
+           on its own, and publishing a new version never disturbs a run.
+        2. Only within the same workflow definition, and only to a published
+           version.
+        3. Refused while any node is active or waiting. Work in someone's hands
+           has no defined meaning in a graph that may no longer contain it.
+        4. Nodes map by step key. Shared keys keep their state, removed nodes
+           are retired, new nodes start unready.
+        5. Refused if the current lifecycle state does not exist in the target
+           lifecycle FSM, which would otherwise strand the workflow.
+        """
+        with self.repository.transaction():
+            previous = self._replay(command["command_id"])
+            if previous:
+                return previous
+            if "workflow.migrate" not in actor_permissions(command):
+                raise ConflictError("Migration requires the 'workflow.migrate' permission")
+            if not command.get("reason"):
+                raise ValidationError("A reason is required to migrate a workflow version")
+
+            workflow = self.repository.get_instance_row(workflow_id)
+            if not workflow:
+                raise NotFoundError("Workflow instance not found")
+            self._validate_revision(workflow, command)
+            if workflow["execution_status"] not in {"RUNNING", "SUSPENDED"}:
+                raise ConflictError(
+                    f"A {workflow['execution_status'].lower()} workflow cannot be migrated")
+
+            target = self.repository.get_published_version(command["target_version_id"])
+            if not target:
+                raise ValidationError("Target workflow version is not published")
+            source = self.repository.get_published_version(workflow["workflow_version_id"])
+            if target["definition_id"] != source["definition_id"]:
+                raise ValidationError(
+                    "A workflow can only migrate between versions of its own definition")
+            if target["id"] == workflow["workflow_version_id"]:
+                raise ConflictError("The workflow is already on that version")
+
+            for status in ("ACTIVE", "WAITING"):
+                in_flight = self.repository.list_steps_by_execution(workflow_id, status)
+                if in_flight:
+                    raise ConflictError(
+                        "Cannot migrate while work is in flight: "
+                        + ", ".join(sorted(step["step_key"] for step in in_flight)))
+
+            if not self.repository.fsm_has_state(
+                    target["lifecycle_fsm_version_id"], workflow["lifecycle_state"]):
+                raise ConflictError(
+                    f"Target version has no lifecycle state '{workflow['lifecycle_state']}'")
+
+            summary = self.repository.remap_step_instances(workflow_id, target["id"])
+            self.repository.update_workflow(workflow_id, {"workflow_version_id": target["id"]})
+            self.repository.append_event(
+                workflow_id, "WORKFLOW_VERSION_MIGRATED", actor_id(command),
+                payload={"from_version_id": source["id"], "to_version_id": target["id"],
+                         "reason": command["reason"], **summary},
+                actor_org_id=actor_org(command),
+            )
+            self._drive(workflow_id)
+            current = self.repository.get_instance_row(workflow_id)
+            self.repository.update_workflow(workflow_id, {"revision": current["revision"] + 1})
+            result = self.get_workflow(workflow_id)
+            self.repository.record_command(
+                command["command_id"], workflow_id, "migrate_version", result["revision"])
+            return result
+
+    def list_work(self, **filters: Any) -> dict[str, Any]:
+        return self.repository.list_work(**filters)
+
+    def stuck_workflows(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self.repository.stuck_workflows(limit)
+
+    def operational_counters(self) -> dict[str, int]:
+        return self.repository.operational_counters()
+
+    def dead_letter_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self.repository.dead_letter_events(limit)
+
+    def redrive_event(self, outbox_id: int) -> bool:
+        return self.repository.redrive_outbox(outbox_id)
+
+    def repair_step(self, step_id: int, command: dict[str, Any]) -> dict[str, Any]:
+        """An authorized, audited manual intervention on a node.
+
+        Repair deliberately bypasses the step FSM, because it exists for the
+        situations the definition did not anticipate. That is why it demands an
+        explicit permission and a reason, and records every use as an event.
+        """
+        with self.repository.transaction():
+            previous = self._replay(command["command_id"])
+            if previous:
+                return previous
+            if "workflow.repair" not in actor_permissions(command):
+                raise ConflictError("Repair requires the 'workflow.repair' permission")
+            if not command.get("reason"):
+                raise ValidationError("A reason is required to repair a step")
+            step = self.repository.get_step(step_id)
+            if not step:
+                raise NotFoundError("Step instance not found")
+            workflow = self.repository.get_instance_row(step["workflow_instance_id"])
+            self._validate_revision(workflow, command)
+
+            action = command["action"]
+            if action == "skip_step":
+                self.repository.update_step(step_id, {
+                    "execution_status": "SKIPPED", "completed_at": now()})
+            elif action == "force_complete_step":
+                self.repository.update_step(step_id, {
+                    "execution_status": "COMPLETED", "completed_at": now(),
+                    "result": command.get("payload", {})})
+            elif action == "retry_step":
+                if step["step_type"] == "AUTOMATED_TASK":
+                    # Requeue the existing job rather than letting the driver
+                    # create a second one for the same node.
+                    self.repository.requeue_job_for_step(step_id)
+                    self.repository.update_step(step_id, {
+                        "execution_status": "WAITING", "completed_at": None, "result": {}})
+                else:
+                    self.repository.update_step(step_id, {
+                        "execution_status": "READY", "completed_at": None, "result": {},
+                        "iteration_number": step["iteration_number"] + 1})
+            elif action == "reassign_step":
+                if not command.get("assignee"):
+                    raise ValidationError("reassign_step requires an assignee")
+                self.repository.replace_assignments(
+                    step_id, command.get("assignee_type", "USER"), command["assignee"],
+                    command.get("organization_id"), actor_id(command), command["reason"])
+            else:
+                raise ValidationError(f"Unknown repair action: {action!r}")
+
+            if action != "reassign_step" and workflow["execution_status"] in {"FAILED", "SUSPENDED"}:
+                self.repository.update_workflow(workflow["id"], {
+                    "execution_status": "RUNNING", "status": "ACTIVE",
+                    "completed_at": None, "suspended_at": None})
+
+            self.repository.append_event(
+                workflow["id"], f"REPAIR_{action.upper()}", actor_id(command), step_id,
+                payload={"reason": command["reason"], "assignee": command.get("assignee")},
+                actor_org_id=actor_org(command),
+            )
+            self._drive(workflow["id"])
+            current = self.repository.get_instance_row(workflow["id"])
+            self.repository.update_workflow(workflow["id"], {"revision": current["revision"] + 1})
+            result = self.get_workflow(workflow["id"])
+            self.repository.record_command(
+                command["command_id"], workflow["id"], action, result["revision"])
+            return result
+
     def _validate_revision(self, workflow: dict[str, Any], command: dict[str, Any]) -> None:
         expected = command.get("expected_revision")
         if expected is not None and expected != workflow["revision"]:
@@ -67,7 +247,7 @@ class WorkflowEngine:
 
     def start_workflow(self, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
-            previous = self.repository.command_result(command["command_id"])
+            previous = self._replay(command["command_id"])
             if previous:
                 return previous
             version = self.repository.get_published_version(command["workflow_version_id"])
@@ -87,12 +267,12 @@ class WorkflowEngine:
             workflow = self.repository.get_instance_row(workflow_id)
             self.repository.update_workflow(workflow_id, {"revision": workflow["revision"] + 1})
             result = self.get_workflow(workflow_id)
-            self.repository.record_command(command["command_id"], workflow_id, "start_workflow", result)
+            self.repository.record_command(command["command_id"], workflow_id, "start_workflow", result["revision"])
             return result
 
     def start_child_workflow(self, parent_id: int, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
-            previous = self.repository.command_result(command["command_id"])
+            previous = self._replay(command["command_id"])
             if previous:
                 return previous
             parent = self.repository.get_instance_row(parent_id)
@@ -124,7 +304,7 @@ class WorkflowEngine:
 
     def apply_action(self, step_id: int, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
-            previous_result = self.repository.command_result(command["command_id"])
+            previous_result = self._replay(command["command_id"])
             if previous_result:
                 return previous_result
             step = self.repository.get_step(step_id)
@@ -152,11 +332,11 @@ class WorkflowEngine:
                 )
                 result = self.get_workflow(workflow["id"])
                 self.repository.record_command(
-                    command["command_id"], workflow["id"], "override_join", result
+                    command["command_id"], workflow["id"], "override_join", result["revision"]
                 )
                 return result
-            if command["action"] == "claim" and isinstance(command.get("actor"), dict) and \
-                    not self.repository.candidate_allowed(step_id, command["actor"]):
+            if command["action"] == "claim" and not self.repository.candidate_allowed(
+                    step_id, actor_of(command).as_dict()):
                 raise ConflictError("Actor is not an eligible candidate for this work")
             transition = self.repository.find_fsm_transition(
                 step["step_fsm_version_id"], step["state"], command["action"]
@@ -173,30 +353,26 @@ class WorkflowEngine:
             if transition.get("reason_required") and not command.get("reason"):
                 raise ValidationError("A reason is required for this transition")
             target = transition["to_state"]
-            values: dict[str, Any] = {"state": target}
+            meta = self.repository.state_meta(step["step_fsm_version_id"], target)
+            category = resolve_category(target, meta["terminal"], meta["category"])
+            values: dict[str, Any] = {"state": target, "execution_status": category}
             if command["action"] in {"start", "resume"}:
                 values["started_at"] = step.get("started_at") or now()
-                values["execution_status"] = "ACTIVE"
                 self.repository.record_attempt_start(step_id, step["iteration_number"])
-            elif target in {"WAITING", "CLARIFICATION_REQUIRED"}:
-                values["execution_status"] = "WAITING"
-            if self.repository.state_is_terminal(step["step_fsm_version_id"], target):
+            if meta["terminal"]:
                 values["completed_at"] = now()
                 values["result"] = command.get("payload", {})
-                values["execution_status"] = (
-                    "FAILED" if target == "FAILED" else
-                    "CANCELLED" if target == "CANCELLED" else
-                    "SKIPPED" if target == "SKIPPED" else "COMPLETED"
-                )
                 self.repository.record_attempt_end(
                     step_id, step["iteration_number"], target, command.get("payload", {})
                 )
             elif command["action"] == "reopen":
                 values.update({
                     "iteration_number": step["iteration_number"] + 1,
-                    "execution_status": "READY", "completed_at": None, "result": {},
+                    "completed_at": None, "result": {},
                 })
             self.repository.update_step(step_id, values)
+            if category == "FAILED":
+                self._handle_step_failure(workflow["id"], self.repository.get_step(step_id))
             if command["action"] in {"assign", "claim", "reassign"} and command.get("assignee"):
                 self.repository.replace_assignments(
                     step_id, command.get("assignee_type", "USER"), command["assignee"],
@@ -215,13 +391,13 @@ class WorkflowEngine:
             current = self.repository.get_instance_row(workflow["id"])
             self.repository.update_workflow(workflow["id"], {"revision": current["revision"] + 1})
             result = self.get_workflow(workflow["id"])
-            self.repository.record_command(command["command_id"], workflow["id"], command["action"], result)
+            self.repository.record_command(command["command_id"], workflow["id"], command["action"], result["revision"])
             self._drive_parent(workflow)
             return result
 
     def apply_workflow_action(self, workflow_id: int, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
-            previous = self.repository.command_result(command["command_id"])
+            previous = self._replay(command["command_id"])
             if previous:
                 return previous
             workflow = self.repository.get_instance_row(workflow_id)
@@ -282,13 +458,13 @@ class WorkflowEngine:
             if values.get("execution_status") == "RUNNING":
                 self._drive(workflow_id)
             result = self.get_workflow(workflow_id)
-            self.repository.record_command(command["command_id"], workflow_id, action, result)
+            self.repository.record_command(command["command_id"], workflow_id, action, result["revision"])
             self._drive_parent(workflow)
             return result
 
     def update_facts(self, workflow_id: int, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
-            previous = self.repository.command_result(command["command_id"])
+            previous = self._replay(command["command_id"])
             if previous:
                 return previous
             workflow = self.repository.get_instance_row(workflow_id)
@@ -305,12 +481,12 @@ class WorkflowEngine:
             )
             self._drive(workflow_id)
             result = self.get_workflow(workflow_id)
-            self.repository.record_command(command["command_id"], workflow_id, "update_facts", result)
+            self.repository.record_command(command["command_id"], workflow_id, "update_facts", result["revision"])
             return result
 
     def receive_signal(self, workflow_id: int, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
-            previous = self.repository.command_result(command["command_id"])
+            previous = self._replay(command["command_id"])
             if previous:
                 return previous
             workflow = self.repository.get_instance_row(workflow_id)
@@ -332,7 +508,7 @@ class WorkflowEngine:
             current = self.repository.get_instance_row(workflow_id)
             self.repository.update_workflow(workflow_id, {"revision": current["revision"] + 1})
             result = self.get_workflow(workflow_id)
-            self.repository.record_command(command["command_id"], workflow_id, "signal", result)
+            self.repository.record_command(command["command_id"], workflow_id, "signal", result["revision"])
             return result
 
     def ingest_external_event(self, workflow_id: int, event: dict[str, Any]) -> dict[str, Any]:
@@ -343,8 +519,7 @@ class WorkflowEngine:
             )
             command_id = f"inbox:{event['connector_name']}:{event['provider_event_id']}"
             if existing and existing["status"] == "PROCESSED":
-                previous = self.repository.command_result(command_id)
-                return previous or self.get_workflow(workflow_id)
+                return self._replay(command_id) or self.get_workflow(workflow_id)
             inbox_id = existing["id"] if existing else self.repository.insert_inbox_event(event)
             result = self.receive_signal(workflow_id, {
                 "command_id": command_id,
@@ -363,7 +538,7 @@ class WorkflowEngine:
 
     def complete_automation_job(self, job_id: int, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
-            previous = self.repository.command_result(command["command_id"])
+            previous = self._replay(command["command_id"])
             if previous:
                 return previous
             job = self.repository.get_job(job_id)
@@ -400,17 +575,20 @@ class WorkflowEngine:
                     "completed_at": now(), "lease_expires_at": None,
                 })
                 self.repository.update_step(
-                    job["step_instance_id"], {"state": "FAILED", "execution_status": "FAILED", "completed_at": now()}
+                    job["step_instance_id"], {"execution_status": "FAILED", "completed_at": now()}
                 )
                 self.repository.append_event(
                     job["workflow_instance_id"], "AUTOMATION_FAILED", actor_id(command),
                     job["step_instance_id"], payload={"job_id": job_id, "error": command.get("error")},
                 )
+                self._handle_step_failure(
+                    job["workflow_instance_id"],
+                    self.repository.get_step(job["step_instance_id"]))
             workflow = self.repository.get_instance_row(job["workflow_instance_id"])
             self.repository.update_workflow(workflow["id"], {"revision": workflow["revision"] + 1})
             self._drive(workflow["id"])
             result = self.get_workflow(workflow["id"])
-            self.repository.record_command(command["command_id"], workflow["id"], "complete_job", result)
+            self.repository.record_command(command["command_id"], workflow["id"], "complete_job", result["revision"])
             return result
 
     def process_due_timers(self) -> int:
@@ -418,14 +596,41 @@ class WorkflowEngine:
             timers = self.repository.due_timers()
             for timer in timers:
                 self.repository.fire_timer(timer["id"])
-                if timer["action"] == "COMPLETE_STEP" and timer.get("step_instance_id"):
-                    step = self.repository.get_step(timer["step_instance_id"])
+                step = (self.repository.get_step(timer["step_instance_id"])
+                        if timer.get("step_instance_id") else None)
+                if timer["action"] == "COMPLETE_STEP":
                     if step and step["execution_status"] == "WAITING":
                         self._complete_system_step(
-                            timer["workflow_instance_id"], step, "TIMER_FIRED", timer.get("payload", {})
-                        )
+                            timer["workflow_instance_id"], step, "TIMER_FIRED",
+                            timer.get("payload", {}))
                         self._drive(timer["workflow_instance_id"])
+                elif timer["action"] == "SLA_BREACH" and step:
+                    self._handle_sla_breach(timer["workflow_instance_id"], step)
             return len(timers)
+
+    def _handle_sla_breach(self, workflow_id: int, step: dict[str, Any]) -> None:
+        """A node passed its due time while still open.
+
+        The breach is always recorded. What follows is the definition's choice,
+        because whether a late review escalates, fails or merely gets noticed is
+        a business decision rather than an engine one.
+        """
+        if step["execution_status"] in TERMINAL_EXECUTION:
+            return
+        config = step.get("configuration", {})
+        action = config.get("on_breach", "NOTIFY")
+        self.repository.append_event(
+            workflow_id, "STEP_SLA_BREACHED", "engine", step["id"],
+            payload={"on_breach": action, "step_key": step.get("step_key")})
+        if action == "ESCALATE" and config.get("escalate_to"):
+            self.repository.replace_assignments(
+                step["id"], config.get("escalate_to_type", "ROLE"), config["escalate_to"],
+                assigned_by="engine", reason="Service level breached")
+        elif action == "FAIL":
+            self.repository.update_step(
+                step["id"], {"execution_status": "FAILED", "completed_at": now()})
+            self._handle_step_failure(workflow_id, self.repository.get_step(step["id"]))
+            self._drive(workflow_id)
 
     def _cancel_execution(self, workflow_id: int, actor: str, reason: str | None) -> None:
         """Cancel a workflow's open work, then every running descendant."""
@@ -442,29 +647,101 @@ class WorkflowEngine:
             )
             self._cancel_execution(child_id, actor, reason)
 
+    @staticmethod
+    def _satisfied(row: dict[str, Any]) -> bool:
+        """Whether a predecessor lets its successors proceed.
+
+        A node that failed under a CONTINUE policy counts as satisfied: the
+        policy says the graph carries on without it.
+        """
+        if row["execution_status"] in SATISFIED_EXECUTION:
+            return True
+        return (row["execution_status"] == "FAILED"
+                and (row.get("configuration") or {}).get("on_failure") == "CONTINUE")
+
     def _can_activate(self, workflow: dict[str, Any], step: dict[str, Any]) -> bool:
         incoming = self.repository.incoming(workflow["id"], step["step_definition_id"])
         if not incoming:
             return True
-        applicable = [row for row in incoming if evaluate(row.get("condition"), workflow["variables"])]
+        rule = (step.get("join_rule") or "ALL") if step["step_type"] == "JOIN" else "ALL"
+        if rule == "ALL_REQUIRED":
+            # Every predecessor, whether or not its edge condition selected it.
+            # Branches that were never taken reach SKIPPED on their own, so this
+            # waits for the whole fan-in rather than only the live paths.
+            return all(self._satisfied(row) for row in incoming)
+        applicable = [row for row in incoming
+                      if evaluate(row.get("condition"), workflow["variables"])]
         if not applicable:
             return False
         if step["step_type"] == "JOIN":
-            rule = step.get("join_rule") or "ALL"
-            satisfied = sum(row["execution_status"] in SATISFIED_EXECUTION for row in applicable)
+            satisfied = sum(self._satisfied(row) for row in applicable)
             if rule == "ANY":
                 return satisfied >= 1
             if rule == "N_OF_M":
-                return satisfied >= int(step.get("configuration", {}).get("required_count", len(applicable)))
-        return all(row["execution_status"] in SATISFIED_EXECUTION for row in applicable)
+                required = int(step.get("configuration", {}).get("required_count", len(applicable)))
+                return satisfied >= required
+        return all(self._satisfied(row) for row in applicable)
+
+    def _is_dead(self, workflow: dict[str, Any], step: dict[str, Any]) -> bool:
+        """True when no future event can activate this node.
+
+        Every predecessor has reached a terminal execution status and the node
+        still cannot activate, so the branch it sits on was not taken. Without
+        this a node on an untaken branch stays pending for the life of the
+        workflow and any progress count based on it is wrong.
+        """
+        incoming = self.repository.incoming(workflow["id"], step["step_definition_id"])
+        if not incoming:
+            return False
+        if not all(row["execution_status"] in TERMINAL_EXECUTION for row in incoming):
+            return False
+        return not self._can_activate(workflow, step)
+
+    def _skip(self, workflow_id: int, step: dict[str, Any]) -> None:
+        """Mark a node whose branch can no longer run.
+
+        Execution status only. The FSM state belongs to the definition, and a
+        custom step FSM need not declare a skipped state or a way into it.
+        """
+        self.repository.update_step(
+            step["id"], {"execution_status": "SKIPPED", "completed_at": now()})
+        self.repository.append_event(
+            workflow_id, "STEP_SKIPPED", "engine", step["id"], step["state"], step["state"],
+            {"reason": "no applicable path can activate this node"})
+
+    def _handle_step_failure(self, workflow_id: int, step: dict[str, Any]) -> None:
+        """Apply the node's declared failure policy.
+
+        Without this a failed node left the workflow RUNNING with nothing able
+        to advance it, which is indistinguishable from a workflow that is
+        merely waiting.
+        """
+        policy = (step.get("configuration") or {}).get("on_failure", "FAIL_WORKFLOW")
+        if policy == "CONTINUE":
+            return
+        if policy == "SUSPEND":
+            self.repository.update_workflow(
+                workflow_id, {"execution_status": "SUSPENDED", "suspended_at": now()})
+            self.repository.append_event(
+                workflow_id, "WORKFLOW_SUSPENDED_ON_FAILURE", "engine", step["id"],
+                payload={"step_key": step.get("step_key")})
+            return
+        self.repository.update_workflow(workflow_id, {
+            "execution_status": "FAILED", "status": "FAILED", "completed_at": now()})
+        self.repository.append_event(
+            workflow_id, "WORKFLOW_FAILED", "engine", step["id"],
+            payload={"step_key": step.get("step_key")})
 
     def _activate(self, workflow: dict[str, Any], step: dict[str, Any]) -> None:
         transition = self.repository.find_fsm_transition(
             step["step_fsm_version_id"], step["state"], "activate"
         )
         state = transition["to_state"] if transition else "READY"
+        meta = self.repository.state_meta(step["step_fsm_version_id"], state)
         self.repository.update_step(
-            step["id"], {"state": state, "execution_status": "READY", "activated_at": now()}
+            step["id"], {"state": state, "activated_at": now(),
+                         "execution_status": resolve_category(
+                             state, meta["terminal"], meta["category"])}
         )
         self.repository.append_event(
             workflow["id"], "STEP_ACTIVATED", "engine", step["id"], step["state"], state
@@ -473,8 +750,19 @@ class WorkflowEngine:
             self.repository.update_workflow(workflow["id"], {"current_stage": step["stage"]})
         config = step.get("configuration", {})
         self.repository.create_candidates(step["id"], config.get("candidates", []))
+        due_at = None
+        if config.get("due_in_seconds"):
+            due_at = stamp(deadline(datetime.now(timezone.utc),
+                                    int(config["due_in_seconds"]), config.get("calendar")))
+            self.repository.create_timer(step_workflow_id := workflow["id"], step,
+                                         due_at, "SLA_BREACH")
+            self.repository.append_event(
+                step_workflow_id, "STEP_DUE_AT_SET", "engine", step["id"],
+                payload={"due_at": due_at})
         if step.get("assignment_role"):
-            self.repository.create_assignment(step["id"], "ROLE", step["assignment_role"], assigned_by="engine")
+            self.repository.create_assignment(
+                step["id"], "ROLE", step["assignment_role"], assigned_by="engine",
+                due_at=due_at)
 
     def _complete_system_step(self, workflow_id: int, step: dict[str, Any],
                               event_type: str, result: dict[str, Any] | None = None) -> None:
@@ -509,7 +797,7 @@ class WorkflowEngine:
         )
 
     def _drive(self, workflow_id: int) -> None:
-        for _ in range(200):
+        for _ in range(DRIVER_ITERATION_LIMIT):
             changed = False
             workflow = self.repository.get_instance_row(workflow_id)
             if not workflow or workflow["execution_status"] != "RUNNING":
@@ -517,6 +805,9 @@ class WorkflowEngine:
             for step in self.repository.list_steps_by_execution(workflow_id, "NOT_READY"):
                 if self._can_activate(workflow, step):
                     self._activate(workflow, step)
+                    changed = True
+                elif self._is_dead(workflow, step):
+                    self._skip(workflow_id, step)
                     changed = True
             for step in self.repository.list_steps_by_execution(workflow_id, "READY"):
                 step_type = step["step_type"]
@@ -555,7 +846,12 @@ class WorkflowEngine:
                     )
                     changed = True
                 elif step_type == "TIMER":
-                    self.repository.create_timer(workflow_id, step)
+                    config = step.get("configuration", {})
+                    due = deadline(datetime.now(timezone.utc),
+                                   int(config.get("delay_seconds", 0)),
+                                   config.get("calendar"))
+                    self.repository.create_timer(
+                        workflow_id, step, stamp(due), "COMPLETE_STEP")
                     self.repository.update_step(
                         step["id"], {"state": "WAITING", "execution_status": "WAITING",
                                      "started_at": now()}
@@ -620,17 +916,30 @@ class WorkflowEngine:
                         changed = True
                     elif any(item["execution_status"] in {"FAILED", "CANCELLED"} for item in required):
                         policy = step.get("configuration", {}).get("child_failure_policy", "FAIL")
-                        if policy == "FAIL":
+                        if policy == "CONTINUE":
+                            # The parent carries on once every awaited child has
+                            # settled, successfully or not.
+                            if all(item["execution_status"] in TERMINAL_EXECUTION
+                                   for item in awaited):
+                                self._complete_system_step(
+                                    workflow_id, step, "SUBWORKFLOWS_SETTLED",
+                                    {"child_failure_policy": "CONTINUE"})
+                                changed = True
+                        else:
                             self.repository.update_step(
-                                step["id"], {"state": "FAILED", "execution_status": "FAILED", "completed_at": now()}
+                                step["id"], {"execution_status": "FAILED", "completed_at": now()}
                             )
                             self.repository.append_event(
                                 workflow_id, "SUBWORKFLOW_FAILED", "engine", step["id"]
                             )
+                            self._handle_step_failure(
+                                workflow_id, self.repository.get_step(step["id"]))
                             changed = True
             if not changed:
                 return
-        raise RuntimeError("Workflow did not reach a stable state")
+        raise ExecutionError(
+            f"Workflow {workflow_id} did not reach a stable state within "
+            f"{DRIVER_ITERATION_LIMIT} driver iterations")
 
     def _drive_parent(self, workflow: dict[str, Any]) -> None:
         parent_id = workflow.get("parent_workflow_instance_id")

@@ -128,14 +128,31 @@ follow; none block the first release.
    option.
 2. Whether the operator console remains a Flow deliverable or becomes the host
    application's responsibility.
-3. What a repeated command returns: the original result exactly as stored, or
-   the workflow's current state. See OPS-7 in the requirements.
+3. Whether the business-calendar model needs holidays per organization rather
+   than per workflow definition.
 
 ## Decided
 
 **Oracle is the production adapter.** SQLite stays for development and tests.
 PostgreSQL follows only if a need for it appears. The ISRP documents name
 PostgreSQL first and are now out of date on this point.
+
+**A repeated command returns current state.** Flow stores a receipt of
+`{workflow, action, revision}`, not a copy of the original response, and a
+replay re-reads the workflow. Keeping the original response verbatim would make
+command storage grow with the square of the number of commands, and a caller
+retrying after a timeout almost always wants to know where things stand now.
+
+**Authority never comes from the request body.** The HTTP shell reads identity
+from a trusted header a gateway injects; the request model cannot express a
+permission. With no gateway configured the caller is anonymous and holds
+nothing, so a misconfigured deployment fails closed rather than open.
+
+**Version migration is explicit and narrow.** Publishing a version never
+disturbs a running instance. Migration is a permissioned, reasoned command,
+only within one definition, refused while work is in flight, mapping nodes by
+step key. A silent remapping of work in someone's hands would be worse than a
+refusal.
 
 **The transaction is host-owned.** Proven by `examples/embedded-host` and
 `tests/test_embedding.py`: the host supplies the connection, Flow never

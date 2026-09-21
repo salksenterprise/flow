@@ -1,17 +1,17 @@
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fsm_definition (
   id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-  scope TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  scope TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS fsm_version (
   id INTEGER PRIMARY KEY AUTOINCREMENT, definition_id INTEGER NOT NULL REFERENCES fsm_definition(id),
   version_number INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'DRAFT', initial_state TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, published_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), published_at TEXT,
   UNIQUE(definition_id, version_number)
 );
 CREATE TABLE IF NOT EXISTS fsm_state_definition (
   id INTEGER PRIMARY KEY AUTOINCREMENT, fsm_version_id INTEGER NOT NULL REFERENCES fsm_version(id),
-  state_key TEXT NOT NULL, terminal INTEGER NOT NULL DEFAULT 0,
+  state_key TEXT NOT NULL, terminal INTEGER NOT NULL DEFAULT 0, category TEXT,
   UNIQUE(fsm_version_id, state_key)
 );
 CREATE TABLE IF NOT EXISTS fsm_transition_definition (
@@ -23,13 +23,13 @@ CREATE TABLE IF NOT EXISTS fsm_transition_definition (
 CREATE TABLE IF NOT EXISTS workflow_definition (
   id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT 'GENERIC',
-  status TEXT NOT NULL DEFAULT 'ACTIVE', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  status TEXT NOT NULL DEFAULT 'ACTIVE', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS workflow_version (
   id INTEGER PRIMARY KEY AUTOINCREMENT, definition_id INTEGER NOT NULL REFERENCES workflow_definition(id),
   version_number INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'DRAFT',
   lifecycle_fsm_version_id INTEGER REFERENCES fsm_version(id),
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, published_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), published_at TEXT,
   UNIQUE(definition_id, version_number)
 );
 CREATE TABLE IF NOT EXISTS step_definition (
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS workflow_instance (
   root_workflow_instance_id INTEGER REFERENCES workflow_instance(id),
   parent_step_instance_id INTEGER, relationship_type TEXT, relationship_key TEXT,
   required_flag INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), completed_at TEXT,
   suspended_at TEXT, cancelled_at TEXT
 );
 CREATE TABLE IF NOT EXISTS workflow_subject (
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS workflow_fact_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_instance_id INTEGER NOT NULL REFERENCES workflow_instance(id),
   fact_key TEXT NOT NULL, previous_value_json TEXT, new_value_json TEXT, source_type TEXT NOT NULL,
   source_reference TEXT, actor TEXT NOT NULL, revision INTEGER NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS step_instance (
   id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_instance_id INTEGER NOT NULL REFERENCES workflow_instance(id),
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS step_instance (
 );
 CREATE TABLE IF NOT EXISTS step_attempt (
   id INTEGER PRIMARY KEY AUTOINCREMENT, step_instance_id INTEGER NOT NULL REFERENCES step_instance(id),
-  iteration_number INTEGER NOT NULL, started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  iteration_number INTEGER NOT NULL, started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   submitted_at TEXT, completed_at TEXT, outcome TEXT, result_json TEXT,
   UNIQUE(step_instance_id, iteration_number)
 );
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS work_assignment (
   assignee_type TEXT NOT NULL DEFAULT 'ROLE', assignee TEXT NOT NULL,
   organization_id TEXT, assigned_by TEXT, reason TEXT,
   mandatory INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'OPEN', due_at TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, ended_at TEXT
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), ended_at TEXT
 );
 CREATE TABLE IF NOT EXISTS work_candidate (
   id INTEGER PRIMARY KEY AUTOINCREMENT, step_instance_id INTEGER NOT NULL REFERENCES step_instance(id),
@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS signal_receipt (
   id INTEGER PRIMARY KEY AUTOINCREMENT, command_id TEXT NOT NULL UNIQUE,
   workflow_instance_id INTEGER NOT NULL REFERENCES workflow_instance(id),
   signal_type TEXT NOT NULL, correlation_key TEXT, payload_json TEXT NOT NULL DEFAULT '{}',
-  received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, consumed_at TEXT,
+  received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), consumed_at TEXT,
   consumed_step_instance_id INTEGER REFERENCES step_instance(id)
 );
 CREATE TABLE IF NOT EXISTS automation_job (
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS automation_job (
   step_instance_id INTEGER NOT NULL REFERENCES step_instance(id),
   handler TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'QUEUED', attempt_count INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 3, input_json TEXT NOT NULL DEFAULT '{}', result_json TEXT,
-  available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, claimed_by TEXT, claimed_at TEXT,
+  available_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), claimed_by TEXT, claimed_at TEXT,
   lease_expires_at TEXT, completed_at TEXT, last_error TEXT
 );
 CREATE TABLE IF NOT EXISTS durable_timer (
@@ -122,31 +122,31 @@ CREATE TABLE IF NOT EXISTS workflow_event (
   sequence_number INTEGER NOT NULL, step_instance_id INTEGER REFERENCES step_instance(id),
   event_type TEXT NOT NULL, actor TEXT NOT NULL, actor_org_id TEXT,
   previous_state TEXT, new_state TEXT, payload_json TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE(workflow_instance_id, sequence_number)
 );
 CREATE TABLE IF NOT EXISTS workflow_command (
   command_id TEXT PRIMARY KEY, workflow_instance_id INTEGER NOT NULL REFERENCES workflow_instance(id),
-  action TEXT NOT NULL, result_json TEXT NOT NULL, processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  action TEXT NOT NULL, result_json TEXT NOT NULL, processed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS inbox_event (
   id INTEGER PRIMARY KEY AUTOINCREMENT, connector_name TEXT NOT NULL, provider_event_id TEXT NOT NULL,
   event_type TEXT NOT NULL, correlation_key TEXT, payload_json TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'RECEIVED', attempts INTEGER NOT NULL DEFAULT 0,
-  received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, processed_at TEXT, last_error TEXT,
+  received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), processed_at TEXT, last_error TEXT,
   UNIQUE(connector_name,provider_event_id)
 );
 CREATE TABLE IF NOT EXISTS outbox_event (
   id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
   event_type TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
   attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 10,
-  next_attempt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, claimed_by TEXT, claimed_at TEXT,
-  last_error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, processed_at TEXT
+  next_attempt_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), claimed_by TEXT, claimed_at TEXT,
+  last_error TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), processed_at TEXT
 );
 CREATE TABLE IF NOT EXISTS webhook_subscription (
   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, target_url TEXT NOT NULL,
   event_types_json TEXT NOT NULL DEFAULT '[]', secret TEXT, active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS outbox_delivery (
   id INTEGER PRIMARY KEY AUTOINCREMENT, outbox_event_id INTEGER NOT NULL REFERENCES outbox_event(id),
@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS outbox_delivery (
 );
 CREATE TABLE IF NOT EXISTS schema_metadata (
   key TEXT PRIMARY KEY, value TEXT NOT NULL,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 """
 
@@ -172,9 +172,17 @@ CREATE INDEX IF NOT EXISTS idx_step_instance_workflow ON step_instance(workflow_
 CREATE INDEX IF NOT EXISTS idx_event_workflow ON workflow_event(workflow_instance_id, sequence_number);
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_event(status,next_attempt_at,id);
 CREATE INDEX IF NOT EXISTS idx_workflow_parent ON workflow_instance(parent_workflow_instance_id);
+CREATE INDEX IF NOT EXISTS idx_assignment_open ON work_assignment(assignee,status);
+CREATE INDEX IF NOT EXISTS idx_step_execution ON step_instance(execution_status,workflow_instance_id);
+CREATE INDEX IF NOT EXISTS idx_command_workflow ON workflow_command(workflow_instance_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_execution ON workflow_instance(execution_status,id);
 """
 
 # Stamped into schema_metadata on first initialization. Its presence is what
 # tells initialize() that the legacy 0.2 migration has already been applied and
 # must never run against live rows again.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+# Stamped onto every outbound message so a consumer can tell which shape it is
+# reading. Bump it whenever the event envelope changes.
+EVENT_SCHEMA_VERSION = 1
