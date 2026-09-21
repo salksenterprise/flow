@@ -120,20 +120,26 @@ COMPLETED
 
 Exceptional states include BLOCKED, FAILED, SKIPPED, and CANCELLED. Clarification can repeat within the step FSM without rebuilding the assessment DAG.
 
-## Actor modes
+## Actor modes and phase boundary
 
-Execution mode is independent of workflow state:
+### Current phase
+
+Published ISRP workflows support only:
 
 | Mode | Execution | Completion authority |
 |---|---|---|
-| HUMAN | A person performs the work | Authorized person |
-| AI_ASSISTED_HUMAN | AI prepares a recommendation or draft | Authorized person |
-| AI_AUTOMATED_SUPERVISED | AI performs an action | Human supervisor |
-| AUTOMATION | A service performs a deterministic action | System policy |
+| HUMAN | A person performs intake, response, review, or approval work | Authorized person |
+| AUTOMATION | A service performs deterministic rules, validation, routing, timers, projection, or integration work | Configured system policy |
 
-A work item records its execution mode, assignee or candidate group, owning organization, supervisor where required, inputs, outputs, and completion authority.
+A work item records its execution mode, assignee or candidate group, owning organization, inputs, outputs, and completion authority.
 
-AI activity must retain model reference, prompt/template version, input and output snapshots, policy result, confidence where meaningful, and human approval. AI output must not silently replace an accountable human decision.
+Current automation does not infer security meaning from unstructured evidence, determine whether a requirement is met, generate requirement responses, or propose citations. Requirement selection uses versioned business rules and structured intake values. Security conclusions and evidence citations are created or verified by authorized humans.
+
+### Future phase
+
+AI_ASSISTED_HUMAN and AI_AUTOMATED_SUPERVISED are reserved for separately published future workflow versions. Future AI creates proposals only; an authorized human approval and deterministic apply step produce authoritative ISRP changes.
+
+Future AI activity must retain model reference, prompt/template version, exact evidence-version inputs, output snapshot, policy result, confidence where meaningful, and human disposition. See [Current and future phases](phases.md).
 
 ## Parent-child status aggregation
 

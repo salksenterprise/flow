@@ -20,6 +20,19 @@ Use NoSQL, search, reporting, or vector stores only as derived projections. The 
 - Map flexible metadata to PostgreSQL JSONB and an Oracle JSON-capable column.
 - Keep frequently filtered, joined, constrained, or authorized fields as normal columns.
 
+
+## Current and future implementation boundary
+
+The current schema and published workflows are deterministic. They implement human work, rule-based automation, evidence versioning, requirement selection, work packages, assertions, determinations, decisions, audit, outbox, and RDBMS projections.
+
+Current execution modes are HUMAN and AUTOMATION. Any generic type column may be designed to accept future values, but current validation and workflow publication reject AI_ASSISTED_HUMAN and AI_AUTOMATED_SUPERVISED.
+
+Current proposal records are source-neutral and permit only RULE and INTEGRATION sources. AI-specific analysis, input, output, policy, and proposal entities are deferred to the future phase.
+
+Future entities may include AI_ANALYSIS_RUN, AI_ANALYSIS_INPUT, AI_ANALYSIS_OUTPUT, REQUIREMENT_APPLICABILITY_PROPOSAL, REQUIREMENT_PREFILL_PROPOSAL, PREFILL_PROPOSAL_CITATION, AI_POLICY_RESULT, and AI_HUMAN_REVIEW. They extend the model without replacing immutable evidence, response, determination, decision, audit, or outbox records.
+
+See [Current and future phases](phases.md).
+
 ## Core relationships
 
 ~~~text

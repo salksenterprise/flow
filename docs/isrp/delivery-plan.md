@@ -7,7 +7,8 @@
 - Start with PostgreSQL; validate Oracle portability continuously and implement the Oracle adapter when required.
 - Treat workflow definitions and requirement versions as immutable after publication.
 - Make every command idempotent and every mutable aggregate revision-controlled.
-- Add NoSQL or search only for a measured read, search, reporting, or AI retrieval need.
+- Add NoSQL or search only for a measured read, search, or reporting need in the current phase; AI retrieval remains future scope.
+- Keep the current ISRP release deterministic and non-AI.
 
 ## Iteration 0: Decisions and contracts
 
@@ -151,22 +152,25 @@ Acceptance:
 - Evidence replacement preserves the original and flags affected citations for revalidation.
 - Evidence authorization is enforced independently of assessment metadata.
 
-## Iteration 8: Actor modes and automation
+## Iteration 8: Deterministic actor modes and automation
 
 Deliver:
 
-- HUMAN, AI_ASSISTED_HUMAN, AI_AUTOMATED_SUPERVISED, and AUTOMATION modes
-- Completion authority policy
-- AI provenance records
-- Human supervisor approval
+- HUMAN and AUTOMATION execution modes
+- Completion-authority policy
+- Rule-based metadata augmentation
+- Deterministic evidence validation, hashing, storage, and supported text extraction
 - Automated connector tasks
-- Retry, timeout, and failure policies
+- Retry, timeout, failure, and manual-review policies
+- Workflow publication validation that rejects AI modes in current ISRP definitions
 
 Acceptance:
 
-- AI assistance cannot complete a human-authority task.
-- Supervised AI output remains pending until an authorized supervisor acts.
+- Automation cannot complete a human-authority task.
+- Requirement applicability and outcomes are not inferred from unstructured evidence.
+- Security conclusions and citations require authorized human action.
 - Automation retries do not duplicate side effects.
+- Current published ISRP workflows contain no AI execution nodes.
 
 ## Iteration 9: RDBMS parent-child projections
 
@@ -245,6 +249,33 @@ Acceptance:
 - Every projection can be rebuilt from authoritative data and events.
 - PostgreSQL and Oracle adapters pass the same repository contract tests.
 
+
+## Future phase: AI-assisted ISRP
+
+This phase begins only after the deterministic releases are operationally proven and AI governance is approved.
+
+Potential deliverables:
+
+- AI_ASSISTED_HUMAN and AI_AUTOMATED_SUPERVISED execution modes
+- Evidence-content analysis
+- Metadata-inference proposals
+- Requirement-applicability proposals
+- Response-prefill proposals
+- Evidence-citation proposals
+- Missing-evidence and potential-finding proposals
+- Model, prompt, input, output, policy, confidence, and cost provenance
+- Mandatory human disposition and deterministic application of accepted proposals
+- AI evaluation, monitoring, rollback, and retirement controls
+- Separately published AI-assisted workflow versions
+
+Acceptance:
+
+- AI output is never an authoritative responder assertion, reviewer determination, or final decision.
+- Every accepted proposal records the human actor, edits, justification, and source evidence versions.
+- Rejected proposals remain auditable without changing authoritative business data.
+- Existing deterministic workflow instances continue on their original versions.
+- AI capabilities can be disabled without preventing deterministic ISRP execution.
+
 ## Recommended release grouping
 
 Release 1 — Intake foundation:
@@ -257,12 +288,18 @@ Release 2 — Assessment execution:
 - Iterations 5 through 7
 - Runs parallel reviews and manages versioned requirement responses
 
-Release 3 — Automation and governance:
+Release 3 — Deterministic automation and governance:
 
 - Iterations 8 through 11
-- Adds actor modes, roll-ups, issue integration, and enterprise controls
+- Adds deterministic automation, roll-ups, issue integration, and enterprise controls
 
 Release 4 — Scale options:
 
 - Iteration 12
 - Adds only the storage and performance capabilities justified by production evidence
+
+Future release — AI-assisted ISRP:
+
+- Begins after deterministic releases and AI governance approval
+- Uses separate workflow-definition versions
+- Adds proposal-only AI analysis with mandatory human control

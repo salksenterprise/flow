@@ -11,7 +11,8 @@ This document explains how the generic Flow workflow service and the ISRP requir
 | Workflow definitions and versions | Owns | References |
 | DAG nodes, edges, forks, and joins | Owns | Configures through published templates |
 | Step FSM and work-item execution | Owns | Correlates to domain work |
-| Human, AI, and automation execution modes | Owns | Defines business authority |
+| Current human and deterministic automation execution | Owns | Defines business authority |
+| Future AI-assisted execution | Reserved for future workflow versions | Owns proposal approval and authoritative decisions |
 | Request and assessment metadata | References by opaque key | Owns |
 | Requirement catalog and requirement sets | Does not interpret | Owns |
 | Assessment requirement snapshot | Does not interpret | Owns |
@@ -19,6 +20,13 @@ This document explains how the generic Flow workflow service and the ISRP requir
 | Evidence, citations, comments, and findings | Does not store domain records | Owns |
 | Assignment mechanics | Owns work item | Owns requirement scope and authority |
 | Audit | Execution audit | Business and compliance audit |
+
+
+## Current-phase execution boundary
+
+The current ISRP implementation is deterministic. Requirement-set selection uses published rules and structured intake data. Humans create responder assertions, evidence citations, reviewer determinations, and final decisions. Automation validates, routes, calculates, projects, retries, and integrates but does not infer compliance from document content.
+
+Future AI may propose metadata, applicability, response drafts, citations, missing evidence, or potential findings. These proposals remain non-authoritative until an authorized human disposition and deterministic apply command. Current and future assessments use separate published workflow versions. See [Current and future phases](phases.md).
 
 ## End-to-end structure
 

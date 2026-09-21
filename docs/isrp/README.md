@@ -8,6 +8,7 @@ Documents:
 - [Data model](data-model.md): logical entities, relational design, document projections, portability, audit, and consistency rules.
 - [Flow to IS Requirements](requirements-catalog.md): catalog structure, requirement selection, work packages, actor assertions, evidence, decisions, audit, and workflow integration.
 - [RDBMS status projections](status-projections.md): authoritative lifecycle states, derived status summaries, outbox processing, parallel phases, and closure validation.
+- [Current and future phases](phases.md): deterministic current scope and separately governed future AI-assisted capabilities.
 - [Delivery plan](delivery-plan.md): phased implementation plan, acceptance criteria, and sequencing.
 
 ## Core decisions
@@ -25,3 +26,4 @@ Documents:
 11. Compliance outcome, implementation currency, and evidence freshness are modeled separately.
 12. Responder assertions, reviewer determinations, and final decisions are independent, immutable records with distinct authorities.
 13. Request and assessment lifecycle states are authoritative; attention, phase, progress, and compliance summaries are rebuildable RDBMS projections maintained from outbox events.
+14. The current ISRP release is deterministic and supports only HUMAN and AUTOMATION execution. All AI capabilities are future-phase features delivered through new workflow versions and mandatory human governance.

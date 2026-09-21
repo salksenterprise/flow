@@ -6,6 +6,13 @@ This document defines how request-level and assessment-level statuses are stored
 
 The design intentionally separates explicit lifecycle state from derived operational summaries.
 
+
+## Phase boundary
+
+This status-projection design is a current-phase deterministic capability. Projection calculations use explicit relational state and versioned business rules. They do not call models, infer outcomes from document text, or depend on future AI services.
+
+Future AI proposal events may cause the same deterministic projector to recalculate counts after an authorized human accepts and applies a proposal. AI output by itself does not change lifecycle, compliance, attention, or progress projections.
+
 ## Core decision
 
 Use the primary RDBMS for:
