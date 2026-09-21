@@ -116,35 +116,39 @@ Acceptance:
 
 Deliver:
 
-- Stable requirements and immutable requirement versions
-- Domain/group classifications
-- Requirement-set rules
+- Security domains, stable requirements, and immutable requirement versions
+- Versioned requirement sets and applicability rules
+- Baseline, flow, subject, classification, and approved manual overlays
 - Assessment requirement snapshots
-- Applicability and reviewer assignment
-- Requirement-level access control
+- Requirement work packages for responder, reviewer, SME, and approver roles
+- Applicability and requirement-level access control
 
 Acceptance:
 
 - Editing a catalog requirement does not alter an active assessment.
-- Reviewers can be assigned all or a subset of requirements.
-- Applicability decisions include rationale and actor identity.
+- Every selected requirement records its exact version and selection source.
+- Different organizations can be assigned all or a subset of requirements through work packages.
+- Applicability and post-launch scope changes include rationale and actor identity.
 
 ## Iteration 7: Responses and evidence
 
 Deliver:
 
-- Editable response drafts
-- Immutable numbered submissions
-- Reviewer feedback
+- Editable response drafts and immutable numbered submissions
+- Separate compliance outcome, implementation currency, and evidence freshness
+- Responder assertions, reviewer determinations, and final decisions
+- Append-only feedback, commentary, and mandatory change justifications
 - Clarification and resubmission
-- Requirement decisions
-- Evidence references and hashes
+- Immutable evidence versions, citations, hashes, and citation revalidation
 
 Acceptance:
 
 - Draft edits overwrite only the current draft.
-- Submitted versions cannot be edited.
-- Feedback and decisions always reference the submission reviewed.
+- Submitted versions, assertions, determinations, decisions, comments, evidence versions, and citations are immutable.
+- Responders cannot alter reviewer determinations or final decisions.
+- Reviewers cannot overwrite responder assertions.
+- Outcome changes require append-only justification.
+- Evidence replacement preserves the original and flags affected citations for revalidation.
 - Evidence authorization is enforced independently of assessment metadata.
 
 ## Iteration 8: Actor modes and automation

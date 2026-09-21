@@ -173,6 +173,47 @@ Suggested attention rules:
 
 Child records remain authoritative. Parent projections can be rebuilt from children and events. A clarification loop changes attention and step status but normally leaves the assessment lifecycle IN_PROGRESS.
 
+
+## Requirement execution boundary
+
+Flow orchestrates when requirement work starts, who receives it, when clarification or approval is required, and when downstream DAG nodes may activate. ISRP owns the requirement catalog, selected assessment requirements, work packages, responses, evidence, comments, determinations, and final decisions.
+
+A Flow step references an ISRP work package by opaque business keys:
+
+~~~text
+workflow step instance
+    -> ISRP work package
+        -> selected assessment requirements
+            -> responder assertions
+            -> evidence versions and citations
+            -> reviewer determinations
+            -> final decisions
+~~~
+
+A work package is a distribution unit, not the compliance system of record. The same assessment requirement may appear in a responder package, an SME review package, and an approval package with different authorities.
+
+Requirement state is independent of the assessment DAG:
+
+~~~text
+NOT_STARTED
+DRAFT
+SUBMITTED
+IN_REVIEW
+CLARIFICATION_REQUIRED
+RESUBMITTED
+DECIDED
+~~~
+
+Flow receives business events such as PACKAGE_SUBMITTED, CLARIFICATION_REQUESTED, PACKAGE_COMPLETED, and REQUIREMENT_DECIDED. It evaluates configured join and transition conditions without interpreting the security meaning of MET or NOT_MET.
+
+Compliance is represented by separate dimensions:
+
+- outcome: NOT_ASSESSED, MET, PARTIALLY_MET, NOT_MET, or NOT_APPLICABLE
+- implementation currency: UNKNOWN, CURRENT, OUTDATED, PLANNED_REPLACEMENT, or DECOMMISSIONED
+- evidence freshness: NOT_PROVIDED, CURRENT, STALE, EXPIRED, or NOT_REQUIRED
+
+The authoritative chain is responder assertion, reviewer determination, and final decision. One actor never overwrites another actor's conclusion. See [Flow to IS Requirements](requirements-catalog.md) for the complete model.
+
 ## Editing and submission semantics
 
 Request and assessment metadata maintain a current editable representation. Updates use optimistic locking and overwrite current values, while audit events preserve who changed what and when.
@@ -180,10 +221,13 @@ Request and assessment metadata maintain a current editable representation. Upda
 Requirement responses use different semantics:
 
 1. An active draft is editable and can be overwritten.
-2. Submission creates an immutable version.
-3. Reviewer feedback references a specific submitted version.
+2. Submission creates an immutable response and responder assertion.
+3. Reviewer feedback and determinations reference a specific submitted version.
 4. A clarification cycle creates a new draft, normally initialized from the last submission.
 5. Resubmission creates another immutable version.
+6. Final decisions are created only by configured decision authorities and never overwrite responder or reviewer records.
+7. Evidence replacement creates a new evidence version; prior files and citations remain historically addressable.
+8. Notes and commentary are append-only, with corrections expressed as new linked comments.
 
 ## Reliability rules
 

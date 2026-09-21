@@ -6,6 +6,7 @@ Documents:
 
 - [Architecture](architecture.md): service boundaries, lifecycle model, DAG/FSM responsibilities, actor modes, and parent-child status aggregation.
 - [Data model](data-model.md): logical entities, relational design, document projections, portability, audit, and consistency rules.
+- [Flow to IS Requirements](requirements-catalog.md): catalog structure, requirement selection, work packages, actor assertions, evidence, decisions, audit, and workflow integration.
 - [Delivery plan](delivery-plan.md): phased implementation plan, acceptance criteria, and sequencing.
 
 ## Core decisions
@@ -20,3 +21,5 @@ Documents:
 8. PostgreSQL is the recommended initial authoritative data store. Oracle is supported through a separate persistence adapter. NoSQL is an optional read/search projection, not the system of record.
 9. Current metadata may be overwritten with optimistic locking, but every accepted change produces an audit event.
 10. Requirement drafts are editable; submitted requirement responses are immutable and versioned.
+11. Compliance outcome, implementation currency, and evidence freshness are modeled separately.
+12. Responder assertions, reviewer determinations, and final decisions are independent, immutable records with distinct authorities.

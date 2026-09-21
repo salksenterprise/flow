@@ -35,8 +35,11 @@ REQUIREMENT_VERSION 1 ----- many ASSESSMENT_REQUIREMENT
 
 ASSESSMENT_REQUIREMENT 1 ----- many RESPONSE_SUBMISSION
 ASSESSMENT_REQUIREMENT 1 ----- zero/one active RESPONSE_DRAFT
+RESPONSE_SUBMISSION 1 ----- many RESPONDER_ASSERTION
+RESPONSE_SUBMISSION 1 ----- many REVIEWER_DETERMINATION
+ASSESSMENT_REQUIREMENT 1 ----- many FINAL_DECISION
 RESPONSE_SUBMISSION 1 ----- many FEEDBACK
-ASSESSMENT_REQUIREMENT 1 ----- many DECISION
+ASSESSMENT_REQUIREMENT many ----- many WORK_PACKAGE
 
 ISRP_REQUEST 1 ----- one request WORKFLOW_INSTANCE reference
 ISRP_ASSESSMENT 1 ----- one assessment WORKFLOW_INSTANCE reference
@@ -153,43 +156,56 @@ ASSESSMENT_RELATIONSHIP optionally records DEPENDS_ON, BLOCKS, SUPPLEMENTS, SHAR
 
 ## Requirement catalog and assessment snapshot
 
-REQUIREMENT stores the stable identity and code. REQUIREMENT_VERSION stores immutable text, guidance, response schema, and effective dates.
+SECURITY_DOMAIN groups organizational policy domains such as Authentication Domain Standards. IS_REQUIREMENT stores the stable requirement identity and code. IS_REQUIREMENT_VERSION stores immutable published text, guidance, expected evidence, response schema, and effective dates.
+
+REQUIREMENT_SET and immutable REQUIREMENT_SET_VERSION records define which requirement versions apply to an assessment type. REQUIREMENT_SET_MEMBER supports applicability rules and default assignment roles. Assessment creation may combine a baseline set with flow, subject, classification, or approved manual overlays.
 
 ASSESSMENT_REQUIREMENT references the exact requirement version selected for the assessment and records:
 
+- selection source and required flag
 - applicability status and rationale
-- assigned reviewer or owning group
-- current decision status
-- current submitted response number
-- assessment-specific configuration
+- response lifecycle status
+- current assertion, determination, and final-decision pointers
+- current compliance, implementation-currency, and evidence-freshness projections
+- assessment-specific configuration and optimistic revision
 
-This prevents a catalog edit from changing the meaning of an active or completed assessment.
+This prevents a catalog edit from changing the meaning of an active or completed assessment. Changes to launched scope require an authorized, audited amendment.
 
-## Response lifecycle
+## Work packages and assignments
+
+REQUIREMENT_WORK_PACKAGE groups selected assessment requirements for a particular responder, reviewer, SME, or approver activity. WORK_PACKAGE_REQUIREMENT associates a subset of requirements and the actor role. WORK_PACKAGE_ASSIGNMENT targets a user, group, or organization.
+
+A requirement may appear in multiple packages with distinct roles. The work package links to a Flow step instance and has its own assignment FSM, while ASSESSMENT_REQUIREMENT remains the authoritative compliance record.
+
+## Response and decision lifecycle
 
 REQUIREMENT_RESPONSE_DRAFT contains one active editable draft per response cycle:
 
 - assessment_requirement_id
-- response_json
+- response data
+- claimed outcome, implementation currency, and evidence freshness
 - revision
 - updated_by and updated_at
 
-REQUIREMENT_RESPONSE_SUBMISSION is immutable:
+REQUIREMENT_RESPONSE_SUBMISSION is immutable and numbered. It captures the exact response, evidence-version links, citations, actor, role, organization, timestamp, and superseded submission.
 
-- submission_id
-- assessment_requirement_id
-- submission_number
-- response_json
-- submitted_by and submitted_at
-- supersedes_submission_id
+RESPONDER_ASSERTION records what the responder claims. REVIEWER_DETERMINATION records one or more SME conclusions without altering the responder assertion. REQUIREMENT_FINAL_DECISION records the authoritative disposition and may be created only by a configured decision authority.
 
-REQUIREMENT_FEEDBACK references a specific submission and records feedback type, comment, author, and timestamp.
+The three independent dimensions are:
 
-REQUIREMENT_DECISION references the evaluated submission and records MET, PARTIALLY_MET, NOT_MET, NOT_APPLICABLE, or ACCEPTED_EXCEPTION with rationale and decision authority.
+- compliance outcome: NOT_ASSESSED, MET, PARTIALLY_MET, NOT_MET, or NOT_APPLICABLE
+- implementation currency: UNKNOWN, CURRENT, OUTDATED, PLANNED_REPLACEMENT, or DECOMMISSIONED
+- evidence freshness: NOT_PROVIDED, CURRENT, STALE, EXPIRED, or NOT_REQUIRED
+
+Every change creates a superseding immutable record with mandatory justification. Current values on ASSESSMENT_REQUIREMENT are query projections.
+
+REQUIREMENT_FEEDBACK and REQUIREMENT_COMMENT are append-only. Corrections create linked superseding comments rather than editing prior commentary. See [Flow to IS Requirements](requirements-catalog.md) for detailed authority and transition rules.
 
 ## Evidence, findings, and issues
 
-Store large files in controlled object/document storage. EVIDENCE_REFERENCE stores location, content hash, classification, ownership, timestamps, and optional assessment-requirement association.
+Store large files in controlled object/document storage. EVIDENCE_ITEM represents a logical attachment and points to a current immutable EVIDENCE_VERSION. Each version stores its location, content hash, original filename, classification, ownership, scan status, replacement reason, and timestamps. Replacing evidence creates a new version and never overwrites the original object.
+
+EVIDENCE_CITATION links an assessment requirement to an exact evidence version and stores the citation blurb, page or section locator, author, and timestamp. Replacing evidence flags dependent citations for revalidation while preserving the citations used by historical submissions and decisions.
 
 FINDING stores the ISRP-owned noncompliance or concern. ISSUE_REFERENCE stores the external issue-management identifier, connector name, synchronization state, last observed status, and timestamps.
 
