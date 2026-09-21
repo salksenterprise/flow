@@ -236,7 +236,7 @@ Finding
        -> requestor changes solution
        -> reviewer validates
        -> finding may close
-  -> EXTERNALIZE
+  -> REGISTER_NONCOMPLIANCE
        -> remediation case
        -> external issue registration
        -> corrective action plan
