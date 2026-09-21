@@ -45,6 +45,8 @@ The workflow service does not enforce ISRP requirement or assessment semantics.
 
 ## Runtime hierarchy
 
+For a diagram-led explanation of these layers, see the [Workflow visual guide](workflow-visual-guide.md).
+
 ~~~text
 ISRP Request
   Request lifecycle FSM
