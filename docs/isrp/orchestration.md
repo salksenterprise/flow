@@ -404,20 +404,15 @@ Steps 1 and 2 are mechanical and keep every test green. Step 4 is the one that
 needs care: it changes the runtime schema, and the existing migration chain
 should carry it rather than a fresh start.
 
-# Part IX: Documents this replaces
+# Part IX: Documentation lineage
 
-~~~text
-docs/charter.md                        superseded by this section
-docs/requirements.md                   requirement rows fold into ISRP's plan;
-                                       the identifiers survive because tests cite them
-docs/technical-design.md               superseded by this section
-docs/workflow-engine/specification.md  entity reference folds into the data model
-docs/workflow-engine/adoption-guide.md delete; it courts a second consumer
-docs/workflow-engine/visual-guide.md   fold the useful diagrams into the
-                                       ISRP workflow visual guide
-docs/integration.md                    delete with the HTTP shell
-docs/workflow-engine-releases-1-3.md   keep as a historical record
-~~~
+The former Flow charter, requirements, technical design, integration contract,
+and engine-reference directory have been removed. Their current, ISRP-specific
+content is consolidated into this design set; Git history preserves the
+superseded text without leaving two architectures in the documentation tree.
 
-The definition of done survives unchanged. Its rules were written from real
-defects and none of them depended on there being a separate engine.
+[Workflow Engine Releases 1-3](../workflow-engine-releases-1-3.md) remains as
+an explicitly historical delivery record. The
+[definition of done](../definition-of-done.md) remains current because its
+quality gates came from real defects and do not depend on orchestration being a
+separate product.
