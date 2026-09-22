@@ -1,11 +1,13 @@
 # ISRP Orchestration
 
-Status: Draft for review. This is the design ISRP builds to.
+Status: Current. This is the implemented orchestration baseline and the
+authority for execution behavior.
 
-ISRP owns its own orchestration. There is no separate workflow engine, no
-generic core, no repository port and no second product to keep in step. The
-state machines, the dependency graph, the durable timers and the reliability
-plumbing are ISRP code, in ISRP's module tree, using ISRP's types.
+ISRP owns its own orchestration. There is no separate workflow engine, generic
+core, or second product to keep in step. The state machines, dependency graph,
+durable timers, and reliability plumbing are ISRP code in ISRP's module tree,
+using ISRP's types. A repository port remains solely because SQLite and Oracle
+must implement the same persistence behavior.
 
 This section replaces the Flow charter, requirements, technical design and
 engine reference. Those four documents described a domain-neutral product with
@@ -50,7 +52,7 @@ version.
 | `workflow_version` pinning as a separate concern | `isrp_request.workflow_version_id` and `isrp_assessment.workflow_version_id` |
 | the *generic engine* boundary and everything that served it | one codebase; the *database* boundary stays, because Oracle needs it |
 | actor type juggling for string, mapping and object forms | ISRP's authenticated actor, one type |
-| receipts holding a serialized copy of the response | `{owner_type, owner_id, action, revision}` in columns; `ISRP_COMMAND` covers commands that never reach the orchestration |
+| receipts holding a serialized copy of the response | `{owner_type, owner_id, action, revision, request_fingerprint}` in columns; `ISRP_COMMAND` covers commands that never reach orchestration |
 | `WORKFLOW` as a reserved aggregate type in the event log | ISRP aggregate types only |
 | HTTP service shell, webhook subscriptions, operator console | ISRP's own API, its own consumers, its own screens |
 
@@ -295,13 +297,15 @@ was impossible before and is the clearest single argument for fusing.
 
 Every runtime change writes an event and an outbox row in the same transaction.
 Every envelope carries a schema version. Delivery retries only to subscriptions
-that have not already accepted. Provider events are deduplicated on connector
-and provider event id, then translated into signals through the same idempotent
-command path.
+that have not already accepted. Jobs and inbox receipts are leased to a named
+worker; a stale worker cannot complete work after another worker reclaims it.
+Provider events are deduplicated on connector and provider event id, then
+translated into signals through the same idempotent command path.
 
-Commands carry a client-generated identifier; a repeat has one effect and
-returns current state. Mutations validate `expected_revision` and refuse a
-mismatch with no partial write.
+Commands carry a client-generated identifier bound to the operation, target,
+and semantic request payload. An exact repeat has one effect and returns current
+state; conflicting reuse is rejected. Mutations validate `expected_revision`
+and refuse a mismatch with no partial write.
 
 # Part VII: Testing without a boundary
 

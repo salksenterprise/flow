@@ -1,30 +1,30 @@
-# Flow to IS Requirements
+# IS Requirements and Orchestration
 
 > Canonical model: All entity definitions, fields, relationships, constraints, and ownership decisions are consolidated in [Data model](data-model.md). This document describes behavior and uses abbreviated entity views only.
 
 ## Purpose
 
-This document explains how the embedded generic Flow workflow core and the ISRP
-requirements domain work together inside one host application. Flow controls
-orchestration and work progression. ISRP controls the meaning, selection,
-response, evidence, review, and decision history of security requirements.
+This document explains how ISRP orchestration and the requirements domain work
+together inside one application. Orchestration controls work progression. The
+requirements domain controls the meaning, selection, response, evidence,
+review, and decision history of security requirements.
 
 ## Responsibility boundary
 
-| Concern | Flow | ISRP |
+| Concern | ISRP orchestration | ISRP requirements domain |
 |---|---|---|
 | Workflow definitions and versions | Owns | References |
 | DAG nodes, edges, forks, and joins | Owns | Configures through published templates |
 | Step FSM and work-item execution | Owns | Correlates to domain work |
 | Current human and deterministic automation execution | Owns | Defines business authority |
 | Future AI-assisted execution | Reserved for future workflow versions | Owns proposal approval and authoritative decisions |
-| Request and assessment metadata | References by opaque key | Owns |
+| Request and assessment metadata | Reads orchestration fields on the aggregate | Owns business fields |
 | Requirement catalog and requirement sets | Does not interpret | Owns |
 | Assessment requirement snapshot | Does not interpret | Owns |
 | Assertions, determinations, and decisions | Receives progress events | Owns |
 | Evidence, citations, comments, and findings | Does not store domain records | Owns |
 | Assignment mechanics | Owns work item | Owns requirement scope and authority |
-| Audit | Execution audit | Business and compliance audit |
+| Ordered event log | Writes execution events | Writes business and compliance events |
 
 
 ## Current-phase execution boundary
@@ -38,11 +38,11 @@ Future AI may propose metadata, applicability, response drafts, citations, missi
 ~~~text
 ISRP Request
   -> one or more ISRP Assessments
-       -> published Flow workflow version
+       -> pinned workflow-definition version
        -> selected requirement-set versions
        -> assessment requirement snapshot
-       -> Flow assessment DAG
-            -> Flow step instance
+       -> assessment DAG
+            -> orchestration step instance
                  -> ISRP requirement work package
                       -> selected assessment requirements
                       -> assignments and authorities
@@ -53,11 +53,10 @@ ISRP Request
   -> request roll-up and closure
 ~~~
 
-Flow stores opaque ISRP business keys and never interprets the referenced
-domain records. Because Flow is embedded in the ISRP database, ISRP binding
-columns may use foreign keys to Flow workflow and step instances. Directional
-ownership remains clear: ISRP may reference Flow execution identities; Flow
-does not acquire dependencies on ISRP tables or concepts.
+The request or assessment row is the orchestration aggregate; there is no
+opaque workflow reference or separate workflow instance. Work packages link to
+step instances with database-enforced foreign keys. Orchestration does not
+interpret requirement text, evidence, assertions, determinations, or findings.
 
 ## Catalog structure
 
@@ -109,9 +108,10 @@ The result is materialized as ASSESSMENT_REQUIREMENT records. Each record retain
 
 A catalog update never changes an active assessment. Post-launch additions or removals require authorization, rationale, and audit.
 
-## Flow workflow and requirement work packages
+## Orchestration steps and requirement work packages
 
-A Flow node can activate one or more ISRP work packages. A package selects assessment requirements and assigns a business role:
+An orchestration node can activate one or more work packages. A package selects
+assessment requirements and assigns a business role:
 
 ~~~text
 RESPONDER
@@ -143,7 +143,9 @@ Security approval package
 
 The same assessment requirement may appear in several packages. Each actor contributes a separate record; packages never cause one actor's conclusion to overwrite another's.
 
-Flow owns assignment state, due dates, timers, delegation, retry, and escalation. ISRP owns which requirements are in the package and what authority the assignment grants.
+The orchestration module owns assignment state, due dates, timers, delegation,
+retry, and escalation. The requirements module owns which requirements are in
+the package and what authority the assignment grants.
 
 ## Requirement and package states
 
@@ -316,16 +318,17 @@ WORK_PACKAGE_COMPLETED
 FINDING_CREATED
 ~~~
 
-Flow evaluates transitions using configured event names and data conditions. It treats outcome codes as opaque values supplied by ISRP.
+Orchestration evaluates transitions using configured event names and data
+conditions. It treats outcome codes as values supplied by the requirements
+domain and does not infer their security meaning.
 
 ## Parallel review and joins
 
-Parallel SMEs receive separate Flow nodes and ISRP work packages. Two of the
-four policies below are Flow join rules; the other two are ISRP patterns built
-from Flow primitives, and naming them alongside the join rules previously
-implied Flow provided them.
+Parallel SMEs receive separate orchestration nodes and work packages. Three
+policies below are fixed join rules; the others are ISRP patterns built from
+signals and decision authority.
 
-Flow join rules, set on a JOIN node:
+Join rules, set on a JOIN node:
 
 - `ALL`: every applicable predecessor is satisfied.
 - `ANY`: at least one applicable predecessor is satisfied.
@@ -339,10 +342,12 @@ ISRP patterns:
 - Decision authority: progression waits for a final decision regardless of SME
   count, which is again a `WAIT_SIGNAL` node fed by ISRP.
 
-Flow also offers `ALL_REQUIRED`, which waits for every predecessor whether or
+`ALL_REQUIRED` waits for every predecessor whether or
 not its edge condition selected it.
 
-Flow should not infer agreement among conflicting SME determinations. ISRP resolves conflicts through an approval package or decision rule and then emits the authoritative completion event.
+Orchestration does not infer agreement among conflicting SME determinations.
+The requirements domain resolves conflicts through an approval package or
+decision rule and then emits the authoritative completion event.
 
 ## Parent roll-ups
 
@@ -375,8 +380,8 @@ NOT_MET
 A child requirement change updates assessment projections. Assessment changes
 update request projections. Parent states summarize inner execution but do not
 mirror every child state. The production design stores these projections in
-the same Oracle database as the ISRP and embedded Flow records; local execution
-uses SQLite. OUTBOX_EVENT records drive deterministic projection updates.
+the same Oracle database as all other ISRP records; local execution uses
+SQLite. OUTBOX_EVENT records drive deterministic projection updates.
 Controlled closure operations always revalidate authoritative child records.
 See [RDBMS status projections](status-projections.md).
 

@@ -38,9 +38,9 @@ CREATE TABLE IF NOT EXISTS approval_request (
 """
 
 WORKFLOW = {
-    "key": "embedded-approval",
-    "name": "Embedded approval",
-    "description": "Reference workflow for the embedded host example.",
+    "key": "fused-approval",
+    "name": "Fused approval",
+    "description": "Reference process for the fused application fixture.",
     "domain": "EXAMPLE",
     "version": 1,
     "publish": True,
@@ -75,7 +75,7 @@ class ApprovalApp:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """One transaction spanning the host's tables and Flow's."""
+        """One transaction spanning domain and orchestration tables."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             with self.repository.using(self.connection):
@@ -90,8 +90,8 @@ class ApprovalApp:
     def migrate(self) -> None:
         """Everything the host runs once at deploy time.
 
-        Flow's schema installs through the host's own migration step, so both
-        sets of tables are versioned and deployed together.
+        The orchestration schema installs through the application's migration
+        step, so all tables are versioned and deployed together.
         """
         self.repository.create_schema(self.connection)
         self.connection.executescript(DOMAIN_SCHEMA)

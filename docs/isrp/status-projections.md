@@ -5,8 +5,8 @@
 ## Purpose
 
 This document defines how request-level and assessment-level statuses are
-stored and maintained in the same database as the authoritative ISRP model, and
-as the embedded Flow tables.
+stored and maintained beside authoritative domain and orchestration records in
+the ISRP database.
 
 Oracle is the intended production store; SQLite is the verified development and
 test adapter. Oracle remains unproven until its adapter passes the shared
@@ -523,22 +523,21 @@ contract.
 One Oracle database
   -> authoritative ISRP schemas
   -> ISRP history tables
-  -> embedded Flow execution tables
-  -> the shared event log, outbox and inbox
+  -> ISRP orchestration tables
+  -> the ordered event log, outbox and inbox
   -> request/assessment projection tables
   -> PROCESSED_EVENT
 
 One status projector, scheduled by the ISRP application
-  -> drains the shared outbox
+  -> drains the ISRP outbox
   -> updates projections
   -> records processed events
   -> reports lag, retries, and errors
 ~~~
 
-The projector is a routine the host schedules, not a separate deployable. It is
-the same host responsibility as driving Flow's timer, job and delivery routines,
-and it reads one outbox carrying both ISRP domain events and Flow execution
-events, so an assessment's progress and its workflow's transitions arrive in one
-ordered stream.
+The projector is an ISRP-scheduled routine, not a separate deployable. The same
+scheduler drives timers, jobs, inbox processing, and delivery. One outbox
+carries domain and execution events, so assessment progress and orchestration
+transitions arrive in one ordered stream.
 
 External search, NoSQL, reporting, or vector stores can be added later as additional consumers of the same event contract.

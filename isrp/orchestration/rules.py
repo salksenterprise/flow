@@ -97,7 +97,7 @@ def evaluate(rule: dict[str, Any] | None, context: dict[str, Any]) -> bool:
 def validate_rule(rule: Any, label: str) -> None:
     """Reject a malformed or unknown rule at publication time.
 
-    A guard that names an operator Flow does not implement used to evaluate
+    A guard that names an operator orchestration does not implement used to evaluate
     false forever, silently routing every workflow down the wrong branch.
     """
     if rule is None:
@@ -125,5 +125,7 @@ def validate_rule(rule: Any, label: str) -> None:
         )
     if not rule.get("field"):
         raise ValidationError(f"{label} needs a 'field'")
-    if operator in COMPARISONS and not isinstance(rule.get("value"), (int, float)):
+    if (operator in COMPARISONS
+            and (isinstance(rule.get("value"), bool)
+                 or not isinstance(rule.get("value"), (int, float)))):
         raise ValidationError(f"{label} operator '{operator}' needs a numeric 'value'")

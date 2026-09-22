@@ -3,8 +3,9 @@
 ## Delivery principles
 
 - Deliver vertical slices with demonstrable business behavior.
-- Keep ISRP domain logic out of the embedded generic Flow core.
-- Embed Flow in the ISRP application so domain and execution writes share one host-owned transaction.
+- Keep orchestration cohesive inside `isrp/orchestration` without presenting it
+  as a separate product or reusable engine.
+- Commit domain and execution writes in one application-owned transaction.
 - Target Oracle for production. Use SQLite for local development and automated contract tests; do not claim Oracle support until an Oracle environment runs the shared adapter and concurrency suites.
 - Consider PostgreSQL only after Oracle and only for an approved need.
 - Treat workflow definitions and requirement versions as immutable after publication.
@@ -16,15 +17,17 @@
 
 Deliver:
 
-- Architecture decision records for embedded module boundaries, host-owned transactions, Oracle targeting, local-verification limits, and projection strategy
-- ISRP-to-Flow in-process command and event contract
+- Architecture decision records for fused module boundaries, application-owned
+  transactions, Oracle targeting, local-verification limits, and projections
+- Internal orchestration command and event contract
 - Status, actor-mode, and identifier vocabularies
 - Initial authorization and organization model
 - Nonfunctional targets for availability, latency, retention, and audit
 
 Acceptance:
 
-- ISRP can create and correlate a workflow in the same transaction without workflow-core importing ISRP code.
+- ISRP can create a request and its orchestration state in one transaction,
+  without a separate workflow instance.
 - Ownership of every authoritative data element is documented.
 - The documentation distinguishes locally verified SQLite behavior from planned Oracle behavior.
 
@@ -38,16 +41,15 @@ Deliver:
 - Application-generated identifiers
 - UTC timestamp conventions
 - Revision-based optimistic locking
-- Flow's migration invoked from the ISRP migration process, which creates the
-  shared event log, outbox and inbox; ISRP builds none of its own
+- ISRP migrations create the orchestration tables, event log, outbox, and inbox
 - ISRP_COMMAND and PROCESSED_EVENT, the two reliability tables ISRP does own
 - Repository interfaces and SQLite reference adapters
 - Transaction and idempotency test harness
 
 Acceptance:
 
-- A business update, its shared-log event and its outbox row commit atomically
-  in one host-owned transaction, alongside any Flow execution write.
+- A business update, its ordered event, outbox row, and orchestration changes
+  commit atomically in one application-owned transaction.
 - Concurrent edits produce a detectable revision conflict.
 - Repeating an idempotent command does not duplicate data.
 - No acceptance result from SQLite is represented as Oracle certification.
@@ -112,7 +114,7 @@ Deliver:
 - Step assignment, work, clarification, response, submission, and completion states
 - Conditional edges
 - Parallel SME branches
-- ALL, ANY, N_OF_M and ALL_REQUIRED joins, as Flow provides them
+- ALL, ANY, N_OF_M and ALL_REQUIRED joins
 - Quorum and decision-authority progression as WAIT_SIGNAL nodes fed by ISRP
 - Durable timers, business calendars, due times and breach escalation
 
@@ -129,7 +131,7 @@ Deliver:
 
 - Security domains, stable requirements, and immutable requirement versions
 - Versioned requirement sets and applicability rules
-- Baseline, flow, subject, classification, and approved manual overlays
+- Baseline, assessment-type, subject, classification, and approved manual overlays
 - Assessment requirement snapshots
 - Requirement work packages for responder, reviewer, SME, and approver roles
 - Applicability and requirement-level access control
@@ -172,10 +174,8 @@ Deliver:
 - Deterministic evidence validation, hashing, storage, and supported text extraction
 - Automated connector tasks
 - Retry, timeout, failure, and manual-review policies
-- Validation that rejects AI modes in current ISRP definitions. Flow has no
-  execution-mode field and its publication validation cannot enforce this, so
-  ISRP validates its own templates before importing them. See the open
-  dependencies in [Architecture](architecture.md).
+- Publication validation that rejects reserved AI modes and unknown execution
+  modes in current ISRP definitions
 
 Acceptance:
 
@@ -220,7 +220,7 @@ Deliver:
 - Noncompliance eligibility and closure policies
 - Issue-management outbox connector using NONCOMPLIANCE_REGISTRATION_REQUESTED
 - External issue references owned by remediation cases
-- Idempotent provider updates through the inbox shared with Flow
+- Idempotent provider updates through the ISRP inbox
 - Status synchronization and reconciliation
 - Deterministic validation work after external resolution
 - Finding, remediation, issue, CAP, and validation-pending projections

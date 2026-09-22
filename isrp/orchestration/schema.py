@@ -191,7 +191,7 @@ CREATE TABLE IF NOT EXISTS event_log (
     "workflow_command": """
 CREATE TABLE IF NOT EXISTS workflow_command (
   command_id TEXT PRIMARY KEY, owner_type TEXT NOT NULL, owner_id INTEGER NOT NULL,
-  action TEXT NOT NULL, revision INTEGER,
+  action TEXT NOT NULL, revision INTEGER, request_fingerprint TEXT,
   processed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );""",
     "inbox_event": """
@@ -256,14 +256,16 @@ CREATE INDEX IF NOT EXISTS idx_assessment_execution ON isrp_assessment(execution
 # Stamped into schema_metadata on first initialization. Its presence is what
 # tells initialize() that the legacy 0.2 migration has already been applied and
 # must never run against live rows again.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Applied in order by create_schema for a database stamped below the current
 # version. Each entry is (target_version, method name on the repository).
 MIGRATIONS = (
+    (4, "_migrate_to_4_state_category"),
     (5, "_migrate_to_5_shared_event_log"),
     (6, "_migrate_to_6_execution_mode"),
     (7, "_migrate_to_7_owner_aggregates"),
+    (8, "_migrate_to_8_command_fingerprint"),
 )
 
 # Stamped onto every outbound message so a consumer can tell which shape it is

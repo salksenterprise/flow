@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -47,6 +49,32 @@ def actor_permissions(command: dict[str, Any]) -> frozenset[str]:
     return actor_of(command).permissions
 
 
+def command_fingerprint(operation: str, target: Any, command: dict[str, Any]) -> str:
+    """Bind an idempotency key to the operation, target, and semantic request.
+
+    The optimistic revision is deliberately excluded: a network retry carries
+    the revision from the first attempt, even though that attempt advanced it.
+    """
+    payload = {}
+    for key, value in command.items():
+        if key in {"command_id", "expected_revision"}:
+            continue
+        if key == "actor":
+            value = Actor.from_value(value).as_dict()
+        elif isinstance(value, Actor):
+            value = value.as_dict()
+        payload[key] = value
+    try:
+        encoded = json.dumps(
+            {"operation": operation, "target": target, "command": payload},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValidationError(
+            "Command values must be JSON-serializable for durable idempotency") from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class WorkflowEngine:
     """Drives ISRP's two aggregates through their published workflow versions.
 
@@ -90,7 +118,8 @@ class WorkflowEngine:
     def get_assessment(self, assessment_id: int) -> dict[str, Any]:
         return self.get_aggregate(Owner(ASSESSMENT, assessment_id))
 
-    def _replay(self, command_id: str) -> dict[str, Any] | None:
+    def _replay(self, command_id: str, operation: str,
+                request_fingerprint: str) -> dict[str, Any] | None:
         """The current aggregate for a command already applied, or None.
 
         A repeated command has one effect, and the caller is handed the
@@ -98,9 +127,20 @@ class WorkflowEngine:
         copy of the response, so a replay reflects reality rather than a
         snapshot that may be many revisions stale.
         """
+        if not isinstance(command_id, str) or not command_id.strip():
+            raise ValidationError("command_id must be a non-empty string")
         receipt = self.repository.command_result(command_id)
         if not receipt:
             return None
+        stored = receipt.get("request_fingerprint")
+        if stored is None:
+            raise ConflictError(
+                "The command_id belongs to a legacy receipt that was not bound "
+                "to its request; retry with a new command_id")
+        if stored != request_fingerprint:
+            raise ConflictError(
+                "The command_id was already used for a different operation, "
+                "target, or request payload")
         return self.get_aggregate(Owner(receipt["owner_type"], receipt["owner_id"]))
 
     def migrate_version(self, owner: Any, command: dict[str, Any]) -> dict[str, Any]:
@@ -122,7 +162,9 @@ class WorkflowEngine:
         """
         owner = Owner(*owner)
         with self.repository.transaction():
-            previous = self._replay(command["command_id"])
+            operation = "migrate_version"
+            fingerprint = command_fingerprint(operation, owner, command)
+            previous = self._replay(command["command_id"], operation, fingerprint)
             if previous:
                 return previous
             if "workflow.migrate" not in actor_permissions(command):
@@ -173,7 +215,7 @@ class WorkflowEngine:
             self.repository.update_aggregate(owner, {"revision": current["revision"] + 1})
             result = self.get_aggregate(owner)
             self.repository.record_command(
-                command["command_id"], owner, "migrate_version", result["revision"])
+                command["command_id"], owner, operation, result["revision"], fingerprint)
             return result
 
     def list_work(self, **filters: Any) -> dict[str, Any]:
@@ -230,9 +272,14 @@ class WorkflowEngine:
     def claim_inbox_events(self, worker_id: str, limit: int = 20) -> list[dict[str, Any]]:
         return self.repository.claim_inbox_events(worker_id, limit)
 
-    def complete_inbox_event(self, inbox_id: int, error: str | None = None) -> None:
+    def complete_inbox_event(self, inbox_id: int, worker_id: str,
+                             error: str | None = None) -> None:
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValidationError("worker_id must be a non-empty string")
         with self.repository.transaction():
-            self.repository.mark_inbox_processed(inbox_id, error)
+            if not self.repository.mark_inbox_processed(inbox_id, error, worker_id):
+                raise ConflictError(
+                    "Inbox event is not leased to this worker or is no longer processing")
 
     def stuck_aggregates(self, limit: int = 50) -> list[dict[str, Any]]:
         return self.repository.stuck_aggregates(limit)
@@ -254,7 +301,9 @@ class WorkflowEngine:
         explicit permission and a reason, and records every use as an event.
         """
         with self.repository.transaction():
-            previous = self._replay(command["command_id"])
+            operation = command["action"]
+            fingerprint = command_fingerprint(operation, {"step_id": step_id}, command)
+            previous = self._replay(command["command_id"], operation, fingerprint)
             if previous:
                 return previous
             if "workflow.repair" not in actor_permissions(command):
@@ -280,7 +329,8 @@ class WorkflowEngine:
                 if step["step_type"] == "AUTOMATED_TASK":
                     # Requeue the existing job rather than letting the driver
                     # create a second one for the same node.
-                    self.repository.requeue_job_for_step(step_id)
+                    if not self.repository.requeue_job_for_step(step_id):
+                        raise ConflictError("The automation step has no job to retry")
                     self.repository.update_step(step_id, {
                         "execution_status": "WAITING", "completed_at": None, "result": {}})
                 else:
@@ -290,6 +340,8 @@ class WorkflowEngine:
             elif action == "reassign_step":
                 if not command.get("assignee"):
                     raise ValidationError("reassign_step requires an assignee")
+                if step["execution_status"] in TERMINAL_EXECUTION:
+                    raise ConflictError("A terminal step cannot be reassigned")
                 self.repository.replace_assignments(
                     step_id, command.get("assignee_type", "USER"), command["assignee"],
                     command.get("organization_id"), actor_id(command), command["reason"])
@@ -311,7 +363,7 @@ class WorkflowEngine:
             self.repository.update_aggregate(owner, {"revision": current["revision"] + 1})
             result = self.get_aggregate(owner)
             self.repository.record_command(
-                command["command_id"], owner, action, result["revision"])
+                command["command_id"], owner, action, result["revision"], fingerprint)
             return result
 
     def _validate_revision(self, aggregate: dict[str, Any], command: dict[str, Any]) -> None:
@@ -320,7 +372,10 @@ class WorkflowEngine:
             raise ConflictError(f"Revision is {aggregate['revision']}; expected {expected}")
 
     def _start(self, owner_type: str, command: dict[str, Any]) -> dict[str, Any]:
-        previous = self._replay(command["command_id"])
+        operation = f"start_{owner_type.lower()}"
+        target = {"owner_type": owner_type, "request_id": command.get("request_id")}
+        fingerprint = command_fingerprint(operation, target, command)
+        previous = self._replay(command["command_id"], operation, fingerprint)
         if previous:
             return previous
         version = self.repository.get_published_version(command["workflow_version_id"])
@@ -338,7 +393,7 @@ class WorkflowEngine:
         self.repository.update_aggregate(owner, {"revision": aggregate["revision"] + 1})
         result = self.get_aggregate(owner)
         self.repository.record_command(
-            command["command_id"], owner, f"start_{owner_type.lower()}", result["revision"])
+            command["command_id"], owner, operation, result["revision"], fingerprint)
         return result
 
     def start_request(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -354,7 +409,11 @@ class WorkflowEngine:
         nothing that can disagree with the data model.
         """
         with self.repository.transaction():
-            previous = self._replay(command["command_id"])
+            operation = f"start_{ASSESSMENT.lower()}"
+            target = {"owner_type": ASSESSMENT, "request_id": request_id}
+            fingerprint = command_fingerprint(
+                operation, target, {**command, "request_id": request_id})
+            previous = self._replay(command["command_id"], operation, fingerprint)
             if previous:
                 return previous
             request_owner = Owner(REQUEST, request_id)
@@ -362,6 +421,10 @@ class WorkflowEngine:
             if not request:
                 raise NotFoundError(f"Request {request_id} not found")
             self._validate_revision(request, command)
+            if request["execution_status"] != "RUNNING":
+                raise ConflictError(
+                    f"Cannot start an assessment under a request that is "
+                    f"{request['execution_status']}")
             step_id = command.get("parent_step_instance_id")
             if step_id:
                 step = self.repository.get_step(step_id)
@@ -387,7 +450,10 @@ class WorkflowEngine:
 
     def apply_action(self, step_id: int, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
-            previous_result = self._replay(command["command_id"])
+            operation = command["action"]
+            fingerprint = command_fingerprint(operation, {"step_id": step_id}, command)
+            previous_result = self._replay(
+                command["command_id"], operation, fingerprint)
             if previous_result:
                 return previous_result
             step = self.repository.get_step(step_id)
@@ -416,12 +482,18 @@ class WorkflowEngine:
                 )
                 result = self.get_aggregate(owner)
                 self.repository.record_command(
-                    command["command_id"], owner, "override_join", result["revision"]
+                    command["command_id"], owner, "override_join", result["revision"],
+                    fingerprint,
                 )
                 return result
             if command["action"] == "claim" and not self.repository.candidate_allowed(
                     step_id, actor_of(command).as_dict()):
                 raise ConflictError("Actor is not an eligible candidate for this work")
+            if command["action"] in {"assign", "reassign"} and not command.get("assignee"):
+                raise ValidationError(f"{command['action']} requires an assignee")
+            if command.get("assignee_type", "USER") not in {
+                    "USER", "ROLE", "GROUP", "ORGANIZATION"}:
+                raise ValidationError("Unsupported assignee_type")
             transition = self.repository.find_fsm_transition(
                 step["step_fsm_version_id"], step["state"], command["action"]
             )
@@ -475,7 +547,8 @@ class WorkflowEngine:
             current = self.repository.get_aggregate_row(owner)
             self.repository.update_aggregate(owner, {"revision": current["revision"] + 1})
             result = self.get_aggregate(owner)
-            self.repository.record_command(command["command_id"], owner, command["action"], result["revision"])
+            self.repository.record_command(
+                command["command_id"], owner, command["action"], result["revision"], fingerprint)
             self._drive_request(aggregate)
             return result
 
@@ -483,7 +556,9 @@ class WorkflowEngine:
         """Move an aggregate through its own lifecycle FSM, or suspend it."""
         owner = Owner(*owner)
         with self.repository.transaction():
-            previous = self._replay(command["command_id"])
+            operation = command["action"]
+            fingerprint = command_fingerprint(operation, owner, command)
+            previous = self._replay(command["command_id"], operation, fingerprint)
             if previous:
                 return previous
             aggregate = self.repository.get_aggregate_row(owner)
@@ -504,6 +579,9 @@ class WorkflowEngine:
             elif action == "terminate":
                 if not command.get("reason"):
                     raise ValidationError("A reason is required to terminate")
+                if aggregate["execution_status"] not in {"RUNNING", "SUSPENDED"}:
+                    raise ConflictError(
+                        "Only a running or suspended aggregate can be terminated")
                 values = {"execution_status": "CANCELLED", "cancelled_at": now()}
             else:
                 version = self.repository.get_published_version(aggregate["workflow_version_id"])
@@ -541,14 +619,17 @@ class WorkflowEngine:
             if values.get("execution_status") == "RUNNING":
                 self._drive(owner)
             result = self.get_aggregate(owner)
-            self.repository.record_command(command["command_id"], owner, action, result["revision"])
+            self.repository.record_command(
+                command["command_id"], owner, action, result["revision"], fingerprint)
             self._drive_request(aggregate)
             return result
 
     def update_facts(self, owner: Any, command: dict[str, Any]) -> dict[str, Any]:
         owner = Owner(*owner)
         with self.repository.transaction():
-            previous = self._replay(command["command_id"])
+            operation = "update_facts"
+            fingerprint = command_fingerprint(operation, owner, command)
+            previous = self._replay(command["command_id"], operation, fingerprint)
             if previous:
                 return previous
             aggregate = self.repository.get_aggregate_row(owner)
@@ -565,13 +646,16 @@ class WorkflowEngine:
             )
             self._drive(owner)
             result = self.get_aggregate(owner)
-            self.repository.record_command(command["command_id"], owner, "update_facts", result["revision"])
+            self.repository.record_command(
+                command["command_id"], owner, operation, result["revision"], fingerprint)
             return result
 
     def receive_signal(self, owner: Any, command: dict[str, Any]) -> dict[str, Any]:
         owner = Owner(*owner)
         with self.repository.transaction():
-            previous = self._replay(command["command_id"])
+            operation = "signal"
+            fingerprint = command_fingerprint(operation, owner, command)
+            previous = self._replay(command["command_id"], operation, fingerprint)
             if previous:
                 return previous
             aggregate = self.repository.get_aggregate_row(owner)
@@ -593,7 +677,8 @@ class WorkflowEngine:
             current = self.repository.get_aggregate_row(owner)
             self.repository.update_aggregate(owner, {"revision": current["revision"] + 1})
             result = self.get_aggregate(owner)
-            self.repository.record_command(command["command_id"], owner, "signal", result["revision"])
+            self.repository.record_command(
+                command["command_id"], owner, operation, result["revision"], fingerprint)
             return result
 
     def ingest_external_event(self, owner: Any, event: dict[str, Any]) -> dict[str, Any]:
@@ -604,17 +689,20 @@ class WorkflowEngine:
                 event["connector_name"], event["provider_event_id"]
             )
             command_id = f"inbox:{event['connector_name']}:{event['provider_event_id']}"
-            if existing and existing["status"] == "PROCESSED":
-                return self._replay(command_id) or self.get_aggregate(owner)
-            inbox_id = existing["id"] if existing else self.repository.insert_inbox_event(event)
-            result = self.receive_signal(owner, {
+            signal_command = {
                 "command_id": command_id,
                 "actor": f"connector:{event['connector_name']}",
                 "signal_type": event["event_type"],
                 "correlation_key": event.get("correlation_key"),
                 "payload": event.get("payload", {}),
                 "apply_facts": event.get("apply_facts", False),
-            })
+            }
+            if existing and existing["status"] == "PROCESSED":
+                fingerprint = command_fingerprint("signal", owner, signal_command)
+                return (self._replay(command_id, "signal", fingerprint)
+                        or self.get_aggregate(owner))
+            inbox_id = existing["id"] if existing else self.repository.insert_inbox_event(event)
+            result = self.receive_signal(owner, signal_command)
             self.repository.mark_inbox_processed(inbox_id)
             return result
 
@@ -624,7 +712,9 @@ class WorkflowEngine:
 
     def complete_automation_job(self, job_id: int, command: dict[str, Any]) -> dict[str, Any]:
         with self.repository.transaction():
-            previous = self._replay(command["command_id"])
+            operation = "complete_job"
+            fingerprint = command_fingerprint(operation, {"job_id": job_id}, command)
+            previous = self._replay(command["command_id"], operation, fingerprint)
             if previous:
                 return previous
             job = self.repository.get_job(job_id)
@@ -632,6 +722,11 @@ class WorkflowEngine:
                 raise NotFoundError("Automation job not found")
             if job["status"] != "RUNNING":
                 raise ConflictError("Automation job is not running")
+            worker_id = command.get("worker_id")
+            if not worker_id or worker_id != job.get("claimed_by"):
+                raise ConflictError("Automation job is not leased to this worker")
+            if job.get("lease_expires_at") and job["lease_expires_at"] < now():
+                raise ConflictError("Automation job lease has expired")
             owner = Owner(job["owner_type"], job["owner_id"])
             success = command.get("success", True)
             if success:
@@ -646,10 +741,14 @@ class WorkflowEngine:
                         "AUTOMATION_SUCCEEDED", command.get("result", {}),
                     )
             elif job["attempt_count"] < job["max_attempts"]:
-                delay = int(command.get("retry_after_seconds", 2 ** job["attempt_count"]))
+                delay = command.get("retry_after_seconds", 2 ** job["attempt_count"])
+                if (isinstance(delay, bool) or not isinstance(delay, int) or delay < 0):
+                    raise ValidationError(
+                        "retry_after_seconds must be a non-negative whole number")
                 self.repository.update_job(job_id, {
                     "status": "RETRY_WAIT", "last_error": command.get("error"),
-                    "available_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(),
+                    "available_at": stamp(
+                        datetime.now(timezone.utc) + timedelta(seconds=delay)),
                     "lease_expires_at": None,
                 })
                 self.repository.append_event(
@@ -674,15 +773,18 @@ class WorkflowEngine:
             self.repository.update_aggregate(owner, {"revision": aggregate["revision"] + 1})
             self._drive(owner)
             result = self.get_aggregate(owner)
-            self.repository.record_command(command["command_id"], owner, "complete_job", result["revision"])
+            self.repository.record_command(
+                command["command_id"], owner, operation, result["revision"], fingerprint)
             return result
 
     def process_due_timers(self) -> int:
         with self.repository.transaction():
             timers = self.repository.due_timers()
+            touched: set[Owner] = set()
             for timer in timers:
                 self.repository.fire_timer(timer["id"])
                 owner = Owner(timer["owner_type"], timer["owner_id"])
+                touched.add(owner)
                 step = (self.repository.get_step(timer["step_instance_id"])
                         if timer.get("step_instance_id") else None)
                 if timer["action"] == "COMPLETE_STEP":
@@ -692,6 +794,11 @@ class WorkflowEngine:
                         self._drive(owner)
                 elif timer["action"] == "SLA_BREACH" and step:
                     self._handle_sla_breach(owner, step)
+            for owner in touched:
+                aggregate = self.repository.get_aggregate_row(owner)
+                if aggregate:
+                    self.repository.update_aggregate(
+                        owner, {"revision": aggregate["revision"] + 1})
             return len(timers)
 
     def _handle_sla_breach(self, owner: Owner, step: dict[str, Any]) -> None:
@@ -1045,4 +1152,26 @@ class WorkflowEngine:
         request = Owner(REQUEST, aggregate["request_id"])
         row = self.repository.get_aggregate_row(request)
         if row and row["execution_status"] == "RUNNING":
+            before = self._execution_signature(self.repository.get_aggregate(request))
             self._drive(request)
+            after = self.repository.get_aggregate(request)
+            if before != self._execution_signature(after):
+                current = self.repository.get_aggregate_row(request)
+                self.repository.update_aggregate(
+                    request, {"revision": current["revision"] + 1})
+
+    @staticmethod
+    def _execution_signature(aggregate: dict[str, Any] | None) -> Any:
+        """State changed by the driver, excluding the optimistic revision itself."""
+        if aggregate is None:
+            return None
+        return (
+            aggregate.get("lifecycle_status"), aggregate.get("execution_status"),
+            aggregate.get("current_stage"), aggregate.get("completed_at"),
+            tuple(
+                (step["id"], step.get("state"), step.get("execution_status"),
+                 step.get("iteration_number"), step.get("started_at"),
+                 step.get("completed_at"), step.get("result"))
+                for step in aggregate.get("steps", [])
+            ),
+        )

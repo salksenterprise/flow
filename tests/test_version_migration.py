@@ -135,6 +135,26 @@ class VersionMigrationTests(unittest.TestCase):
             self.migrate(self.start(self.v1), strict)
         self.assertIn("lifecycle status", str(raised.exception))
 
+    def test_def9_refuses_a_target_step_fsm_missing_the_current_state(self):
+        incompatible_fsm = {
+            "key": "migrating.incompatible-step", "name": "Incompatible", "version": 1,
+            "initial_state": "PENDING",
+            "states": ["PENDING", {"key": "DONE", "terminal": True}],
+            "transitions": [
+                {"action": "activate", "from": "PENDING", "to": "DONE"}],
+        }
+        incompatible = human("intake")
+        incompatible["fsm"] = incompatible_fsm
+        target = self.engine.import_template(template(
+            "migrating", 5,
+            [incompatible, human("review"), {"key": "end", "name": "End", "type": "END"}],
+            [{"from_step": "intake", "to_step": "review"},
+             {"from_step": "review", "to_step": "end"}]))["workflow_version_id"]
+
+        with self.assertRaises(ConflictError) as raised:
+            self.migrate(self.start(self.v1), target)
+        self.assertIn("current state", str(raised.exception))
+
     def test_def9_refuses_a_completed_workflow_and_a_no_op(self):
         workflow = self.start(self.v1)
         with self.assertRaises(ConflictError):

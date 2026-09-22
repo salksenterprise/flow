@@ -208,7 +208,9 @@ class ReleaseOneToThreeTests(unittest.TestCase):
         jobs = self.engine.claim_automation_jobs("worker-1")
         self.assertEqual(len(jobs), 1)
         workflow = self.engine.complete_automation_job(
-            jobs[0]["id"], command(success=True, result={"result_reference": "isrp://checks/1"})
+            jobs[0]["id"], command(
+                worker_id="worker-1", success=True,
+                result={"result_reference": "isrp://checks/1"})
         )
         self.assertEqual(workflow["execution_status"], "COMPLETED")
 

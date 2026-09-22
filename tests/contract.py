@@ -4,9 +4,9 @@ SQLite is the development adapter and Oracle is the production one. They must
 behave identically, and the only way to know that is to hold them to one suite
 rather than two.
 
-This covers the shared reliability surface too: an adapter must let an
-embedding host write its own domain events, outbox rows and provider receipts
-into the same tables Flow uses.
+This covers the fused reliability surface too: an adapter must let domain and
+orchestration code write events, outbox rows, and provider receipts into the
+same tables.
 
 To certify a new adapter, subclass RepositoryContract with a TestCase, return
 your adapter from make_repository(), and run it. Nothing in here is specific to

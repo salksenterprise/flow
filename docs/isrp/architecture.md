@@ -1,16 +1,16 @@
-# ISRP Architecture Plan
+# ISRP Architecture
 
 ## Purpose
 
 ISRP handles intake, categorization, assessment execution, requirement review,
-validation, findings, issue integration, and review closure. Flow remains a
-generic workflow execution core with no information-security-specific rules or
-records. ISRP embeds that core in-process; Flow is not deployed as a shared
-workflow service.
+validation, findings, issue integration, and review closure. It also owns the
+state machines, dependency graphs, assignments, timers, jobs, signals, and
+reliability records that orchestrate that work. There is no separate workflow
+engine, service, or embedded product.
 
-## Embedded architecture and ownership boundaries
+## Fused architecture and module boundaries
 
-### ISRP host application
+### ISRP domain modules
 
 Owns:
 
@@ -25,22 +25,22 @@ Owns:
 - Reviewer decisions, findings, remediation cases, CAPs, and external issue references
 - Parent-child roll-up policy
 
-### Embedded Flow core
+### ISRP orchestration modules
 
 Owns:
 
 - Immutable, versioned workflow definitions
 - DAG nodes, edges, conditions, forks, and joins
-- Workflow and step instances
+- Request/assessment orchestration state and step instances
 - Step FSM definitions and transitions
 - Human and automated work items
 - Assignments, timers, retries, and escalation signals
 - Idempotent commands, execution audit events, and execution outbox events
 
-The boundary is one of module hygiene, not of deployment: both run in one
-process against one database. ISRP owns the connection and the transaction.
-The orchestration joins that transaction and never commits, rolls back, or
-closes it.
+This boundary is internal module hygiene, not a product boundary. Both module
+sets are ISRP code and use one database. The application owns the connection
+and transaction; orchestration joins that transaction and never independently
+commits, rolls back, or closes it.
 
 ~~~text
 ISRP command
@@ -51,8 +51,7 @@ ISRP command
   -> commit or roll back both sets of changes together
 ~~~
 
-There are no opaque business references to supply. A run belongs to an ISRP
-request or an ISRP assessment, named by the pair:
+A run is an ISRP request or assessment, named internally by the pair:
 
 ~~~text
 owner_type = ISRP_REQUEST      owner_type = ISRP_ASSESSMENT
@@ -61,9 +60,9 @@ owner_id   = 10042             owner_id   = 20017
 
 Those are the rows themselves: orchestration state lives on `isrp_request` and
 `isrp_assessment` beside the business columns, so there is one revision to lock
-against and no pair of records that can disagree. The orchestration modules
-still do not import ISRP's domain models; they take identifiers, statuses and
-configuration.
+against and no pair of records that can disagree. The orchestration package
+remains cohesive and uses identifiers, statuses, and configuration rather than
+reaching arbitrarily through domain objects.
 
 ### Deployment and database decision
 
@@ -75,32 +74,28 @@ Later optional adapter         PostgreSQL, only if a demonstrated need appears
 
 Oracle conformance cannot be proven in the local environment. No document or
 release may claim Oracle support until the Oracle adapter passes the same
-repository contract suite against a real Oracle instance. The ISRP application
-invokes Flow migrations through its own deployment process and schedules Flow's
-timer, job, and outbox routines through host-managed jobs.
+repository contract suite against a real Oracle instance. The ISRP deployment
+process invokes all schema migrations, and ISRP-managed jobs schedule timer,
+automation, inbox, outbox, and projection routines.
 
-### Open dependencies on Flow
+### Current orchestration constraints
 
-Three things this design assumes are not provided by Flow as it stands. Each has
-a workaround; each is recorded so it is not discovered during implementation.
+These are deliberate constraints of the current fused implementation:
 
-1. **`BLOCKED` is not a Flow execution category.** Flow has `NOT_READY`,
+1. **`BLOCKED` is not an execution category.** Orchestration has `NOT_READY`,
    `READY`, `ACTIVE`, `WAITING`, `COMPLETED`, `SKIPPED`, `FAILED` and
    `CANCELLED`. A blocked step FSM state maps to `WAITING`, and ISRP derives
-   `BLOCKED` in its attention projection from its own records. The alternative
-   is to ask for the category in Flow.
-2. **Flow does not enforce execution modes.** Iteration 8 calls for publication
-   validation that rejects AI modes. Flow has no execution-mode field and its
-   validation cannot reject one. ISRP must validate its own templates before
-   calling `import_template`, or the field must be added to Flow.
-3. **`ON_HOLD` cannot return to the previous state automatically.** Flow's FSM
+   `BLOCKED` in its attention projection.
+2. **Published definitions allow only HUMAN and AUTOMATION modes.** Publication
+   validation rejects reserved AI modes and unknown modes. This rule is
+   possible because orchestration is now ISRP-owned.
+3. **`ON_HOLD` cannot return to the previous state automatically.** FSM
    transitions are static `from -> to` pairs, so "resume to whatever state you
    were in" is not expressible. The request and assessment lifecycle FSMs need
    one explicit resume transition per source state.
 
-ISRP's own step vocabulary is otherwise fully supported: Flow lets each state
-declare its execution category, so the table above maps onto the engine without
-Flow recognising any of the names.
+Each ISRP step state declares its execution category, so business vocabulary
+and orchestration behavior remain separate without another product boundary.
 
 ## Runtime hierarchy
 
@@ -172,10 +167,10 @@ here, and drawn in the [workflow visual guide](workflow-visual-guide.md); an
 earlier revision of this document listed a different set of states from the
 guide, which would have left the implementer to choose.
 
-Each state declares the Flow execution category it maps to, which is what lets
-ISRP use its own vocabulary without Flow having to recognise the names.
+Each state declares the execution category it maps to, keeping ISRP's business
+vocabulary separate from graph-driving behavior.
 
-| Step state | Flow category | Meaning |
+| Step state | Execution category | Meaning |
 |---|---|---|
 | `NOT_STARTED` | `NOT_READY` | predecessors not yet satisfied |
 | `AVAILABLE` | `READY` | activatable, nobody has claimed it |
@@ -260,13 +255,13 @@ Child records remain authoritative. Parent projections can be rebuilt from child
 
 ## Requirement execution boundary
 
-The embedded Flow core orchestrates when requirement work starts, who receives
-it, when clarification or approval is required, and when downstream DAG nodes
-may activate. ISRP owns the requirement catalog, selected assessment
+ISRP orchestration determines when requirement work starts, who receives it,
+when clarification or approval is required, and when downstream DAG nodes may
+activate. The requirements domain owns the catalog, selected assessment
 requirements, work packages, responses, evidence, comments, determinations,
 and final decisions.
 
-A Flow step references an ISRP work package by opaque business keys:
+An orchestration step links directly to an ISRP work package:
 
 ~~~text
 workflow step instance
@@ -292,7 +287,10 @@ RESUBMITTED
 DECIDED
 ~~~
 
-Flow receives business events such as PACKAGE_SUBMITTED, CLARIFICATION_REQUESTED, PACKAGE_COMPLETED, and REQUIREMENT_DECIDED. It evaluates configured join and transition conditions without interpreting the security meaning of MET or NOT_MET.
+Orchestration receives events such as PACKAGE_SUBMITTED,
+CLARIFICATION_REQUESTED, PACKAGE_COMPLETED, and REQUIREMENT_DECIDED. It
+evaluates configured joins and transition conditions without interpreting the
+security meaning of MET or NOT_MET.
 
 Compliance is represented by separate dimensions:
 
@@ -300,7 +298,9 @@ Compliance is represented by separate dimensions:
 - implementation currency: UNKNOWN, CURRENT, OUTDATED, PLANNED_REPLACEMENT, or DECOMMISSIONED
 - evidence freshness: NOT_PROVIDED, CURRENT, STALE, EXPIRED, or NOT_REQUIRED
 
-The authoritative chain is responder assertion, reviewer determination, and final decision. One actor never overwrites another actor's conclusion. See [Flow to IS Requirements](requirements-catalog.md) for the complete model.
+The authoritative chain is responder assertion, reviewer determination, and
+final decision. One actor never overwrites another actor's conclusion. See
+[IS requirements](requirements-catalog.md) for the complete model.
 
 
 
@@ -351,8 +351,8 @@ Outbound registration is asynchronous:
 ~~~text
 ISRP transaction
   -> save finding/remediation decision
-  -> engine.record_event(..., "NONCOMPLIANCE_REGISTRATION_REQUESTED")
-       writes the shared log row and its outbox row together
+  -> record_event(..., "NONCOMPLIANCE_REGISTRATION_REQUESTED")
+       writes the ordered log row and its outbox row together
   -> commit
   -> connector creates or locates external issue idempotently
 ~~~
@@ -361,18 +361,18 @@ Inbound updates are also idempotent:
 
 ~~~text
 Issue-management event or reconciliation poll
-  -> engine.record_inbox_event(...)   the shared inbox, deduplicated
+  -> record_inbox_event(...)          the ISRP inbox, deduplicated
   -> correlate connector + provider event ID
   -> update ISSUE_REFERENCE observed state
   -> create ISRP validation work when externally resolved
-  -> emit OUTBOX_EVENT for projections/workflow
+  -> emit OUTBOX_EVENT for projections and orchestration
 ~~~
 
 The issue-management platform remains authoritative for its issue and plan execution state. ISRP retains the external identifiers, synchronized summary, timestamps, and audit trail. External RESOLVED never closes a finding automatically; an authorized reviewer must validate the corrective result against the requirement and evidence.
 
 ## RDBMS-first status projections
 
-The production design keeps authoritative ISRP records, embedded Flow records,
+The production design keeps authoritative domain and orchestration records,
 outbox events, and request/assessment status projections in the same Oracle
 database. Local development and contract verification use SQLite. A separate
 NoSQL or search store is not required, and PostgreSQL is not part of the
@@ -419,14 +419,15 @@ Requirement responses use different semantics:
 
 ## Reliability rules
 
-- Commands carry client-generated idempotency keys.
+- Commands carry client-generated idempotency keys that are bound to the
+  operation, target, and semantic payload; conflicting reuse is rejected.
 - Transitions validate the current revision before committing.
-- ISRP business updates, Flow execution updates, shared log entries, and shared
-  outbox records commit in the same host-owned database transaction.
+- Domain updates, orchestration updates, ordered log entries, and outbox
+  records commit in the same application-owned database transaction.
 - Consumers handle events idempotently.
 - External issue creation and updates never run inside the primary business transaction.
-- Outbound effects and inbound provider events use the outbox and inbox shared
-  with Flow, written through the engine. ISRP keeps no parallel set.
+- Outbound effects and inbound provider events use ISRP's single outbox and
+  inbox. No parallel reliability tables exist.
 - Connector calls and inbound event handling are idempotent and reconcilable.
 - External issue resolution creates validation work and never closes a finding by itself.
 - Long-running work uses durable timers and retry policies.

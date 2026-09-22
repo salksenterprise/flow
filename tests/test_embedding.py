@@ -40,13 +40,13 @@ class EmbeddingContractTests(unittest.TestCase):
         with self.app.transaction() as connection:
             return connection.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]
 
-    # EMB-1: the host supplies the connection; Flow never opens one.
+    # EMB-1: the application supplies the connection; orchestration never opens one.
 
     def test_emb1_embedded_repository_refuses_to_open_a_connection(self):
         repository = SQLiteWorkflowRepository()
         with self.assertRaises(RuntimeError) as raised:
             repository.initialize()
-        self.assertIn("embedded", str(raised.exception))
+        self.assertIn("connection-bound", str(raised.exception))
 
     def test_emb1_host_schema_and_flow_schema_share_one_database(self):
         with self.app.transaction() as connection:
@@ -55,7 +55,7 @@ class EmbeddingContractTests(unittest.TestCase):
         self.assertIn("approval_request", tables)  # the domain's
         self.assertIn("isrp_request", tables)      # the orchestrated aggregate
 
-    # EMB-2: the host commits; Flow calls no commit or rollback.
+    # EMB-2: the application commits; orchestration calls no commit or rollback.
 
     def test_emb2_flow_leaves_the_host_transaction_open(self):
         self.app.connection.execute("BEGIN IMMEDIATE")
@@ -67,13 +67,13 @@ class EmbeddingContractTests(unittest.TestCase):
                 "variables": {},
             })
             self.assertTrue(self.app.connection.in_transaction)
-        # Still the host's to decide, even after Flow has finished with it.
+        # Still the application's to decide after orchestration returns.
         self.assertTrue(self.app.connection.in_transaction)
         self.app.connection.execute("ROLLBACK")
         self.assertEqual(self.event_count(), 0)
 
     def test_emb2_flow_writes_stay_invisible_until_the_host_commits(self):
-        """Direct proof that Flow does not commit behind the host's back."""
+        """Direct proof that orchestration does not commit behind ISRP's back."""
         observer = sqlite3.connect(str(self.path), timeout=5.0)
         try:
             baseline = observer.execute(
