@@ -1,156 +1,46 @@
-# Flow
-# a workflow engine
+# ISRP
 
-Flow is a configurable workflow execution engine built from a domain-neutral Python core, a SQLite persistence adapter, a FastAPI microservice, a delivery worker, and a React administration console.
+The Information Security Review Process: intake, categorization, assessment
+execution, requirement review, evidence, findings, remediation and closure.
 
-The engine executes workflow graphs and FSM-controlled steps. It does not own information-security requirements, assessments, threats, architecture records, findings, or other client-domain data.
+ISRP orchestrates its own work. The state machines, dependency graphs, durable
+timers, work assignment and reliability plumbing are ISRP code, in this
+repository, using ISRP's types. There is no separate workflow engine, service
+or package.
 
-## Architecture
+## Layout
 
-```text
-Domain applications
-    ISR, architecture, threat modeling, vendor review
-                        |
-                        | commands and events
-                        v
-Workflow API -> workflow-core -> SQLite adapter
-      |               |
-      |               +-- graph orchestration
-      |               +-- step FSMs
-      |               +-- conditions and joins
-      v
-Transactional outbox -> delivery worker -> webhooks
-```
+~~~text
+isrp/orchestration     state machines, the graph driver, timers, jobs,
+                       signals, work assignment, the shared event log
+isrp/templates         published workflow definitions
+tests                  orchestration tests and the adapter contract suite
+docs/isrp              the design
+~~~
 
-Repository layout:
+## Running the tests
 
-```text
-packages/workflow-core       Pure Python engine and repository ports
-packages/workflow-sqlite     SQLite schema and repository adapter
-services/workflow-api        FastAPI service adapter
-services/workflow-worker     Outbox/webhook delivery process
-frontend                     React administration console
-examples                     External-domain templates and clients
-tests                        Cross-component engine tests
-docs                         Integration contract
-```
+~~~bash
+PYTHONPATH=.:tests python3 -m unittest discover -s tests
+~~~
 
-## Run with Docker
+No container, no network, no background process. That is deliberate: a test
+that needs infrastructure is a test nobody runs.
 
-Docker builds the React interface inside the image, so Node and npm are not required on the host.
+## Databases
 
-```bash
-docker compose up --build
-```
+SQLite is the development and test adapter. Oracle is the production store and
+is not yet implemented. `tests/contract.py` is what certifies an adapter; an
+Oracle store is a subclass of that suite, not a second copy of it.
 
-Open:
+No release may claim Oracle support until the Oracle adapter passes that suite
+against a real Oracle instance.
 
-- Console: `http://localhost:8000`
-- API documentation: `http://localhost:8000/docs`
+## Design
 
+Start with [the ISRP design set](docs/isrp/README.md), and
+[Orchestration](docs/isrp/orchestration.md) for how execution works.
 
-If port 8000 is already in use, choose another host port:
-
-```bash
-FLOW_PORT=8080 docker compose up --build
-```
-
-Then open `http://localhost:8080`.
-
-Stop the services:
-
-```bash
-docker compose down
-```
-
-Workflow data persists in the `workflow-data` volume. Delete it intentionally with:
-
-```bash
-docker compose down --volumes
-```
-
-## Run locally
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r services/workflow-api/requirements.txt
-pip install -e packages/workflow-core -e packages/workflow-sqlite
-
-export PYTHONPATH="$PWD/packages/workflow-core/src:$PWD/packages/workflow-sqlite/src:$PWD/services/workflow-api:$PWD/services/workflow-worker"
-uvicorn app.main:app --app-dir services/workflow-api --reload --port 8000
-```
-
-In another terminal, optionally run the delivery worker:
-
-```bash
-source .venv/bin/activate
-export PYTHONPATH="$PWD/packages/workflow-core/src:$PWD/packages/workflow-sqlite/src:$PWD/services/workflow-api:$PWD/services/workflow-worker"
-python -m worker.main
-```
-
-Node is needed only for frontend development:
-
-```bash
-cd frontend
-npm ci
-npm run dev
-```
-
-## Generic runtime concepts
-
-- Immutable, versioned workflow definitions
-- Versioned, configurable workflow lifecycle and step FSMs
-- Human, decision, automated, subworkflow, signal-wait, timer, fork, join, milestone, and end steps
-- Separate lifecycle, workflow-execution, and node-execution states
-- Conditional transitions using a constrained JSON rule language
-- Parallel branches with `ALL`, `ANY`, and `N_OF_M` joins
-- Parent-child workflows with required and optional children
-- Idempotent inbound signals and controlled workflow facts
-- Clarification and response cycles inside human work
-- Generic subjects, opaque business references, and work iterations
-- User, role, group, and organization assignment context
-- Asynchronous automation jobs, durable timers, retries, and leases
-- Durable inbox, transactional outbox, webhook retries, and dead-letter status
-- Optimistic workflow revisions
-- Idempotent client commands
-- Ordered audit events
-- Transactional event outbox and signed webhooks
-
-## Client integration
-
-A client starts a workflow with its own business reference:
-
-```json
-{
-  "command_id": "client-generated-uuid",
-  "workflow_version_id": 1,
-  "title": "Review ASMT-502",
-  "business_type": "ISR_ASSESSMENT",
-  "business_key": "ASMT-502",
-  "correlation_id": "ISR-REQ-200",
-  "variables": {"identity_review_required": true},
-  "subjects": []
-}
-```
-
-The engine treats all domain values as opaque. See the
-[workflow engine documentation](docs/workflow-engine/README.md),
-[integration contract](docs/integration.md),
-[Releases 1–3](docs/workflow-engine-releases-1-3.md), and the
-[ISR example](examples/information-security-review/README.md).
-
-## Rule format
-
-```json
-{"field": "specialist_review_required", "operator": "eq", "value": true}
-```
-
-Supported operators: `eq`, `ne`, `in`, `not_in`, `exists`, and `truthy`. Compose rules with `all`, `any`, and `not`. Rules are data and cannot execute arbitrary code.
-
-## Tests
-
-```bash
-export PYTHONPATH="$PWD/packages/workflow-core/src:$PWD/packages/workflow-sqlite/src:$PWD/services/workflow-api:$PWD/services/workflow-worker"
-python -m unittest discover -s tests -v
-```
+Several documents under `docs/` describe an earlier architecture in which
+orchestration was a separate, domain-neutral product. They are marked superseded
+and are retained only until their content has been folded into the design set.

@@ -1,5 +1,10 @@
 # Flow Technical Design
 
+> **Superseded.** ISRP now owns its orchestration directly; there is no separate
+> workflow engine, service or package. This document described that engine and is
+> retained only until its content has been folded into the ISRP design set. See
+> [ISRP Orchestration](isrp/orchestration.md) for the current design.
+
 Status: Draft for review.
 
 This document describes how Flow works. The [charter](charter.md) says why it
@@ -22,8 +27,8 @@ implemented but uncovered by a test, or not implemented at all, the section
 says so in place rather than at the end, because a reader who stops halfway
 should not be misled by the half they read.
 
-The system as described is 1,541 lines of core, 1,462 lines of SQLite adapter,
-463 lines of HTTP shell, and 131 tests.
+The system as described is 1,601 lines of core, 1,643 lines of SQLite adapter,
+463 lines of HTTP shell, and 145 tests.
 
 # Part I: Shape
 
@@ -92,16 +97,16 @@ holds in the other (`EMB-12`).
 
 | Module | Lines | Responsibility |
 |---|---:|---|
-| `workflow_core/engine.py` | 949 | Commands, the driver, FSM transitions, repair, migration |
+| `workflow_core/engine.py` | 1003 | Commands, the driver, FSM transitions, repair, migration, the shared log |
 | `workflow_core/validation.py` | 150 | Publication-time checks |
 | `workflow_core/rules.py` | 129 | The guard language |
 | `workflow_core/calendars.py` | 94 | Working-time deadlines |
-| `workflow_core/ports.py` | 75 | The repository interface |
+| `workflow_core/ports.py` | 81 | The repository interface |
 | `workflow_core/actor.py` | 58 | Identity as a value |
 | `workflow_core/states.py` | 46 | Execution categories and policy vocabularies |
 | `workflow_core/errors.py` | 30 | The error contract |
-| `workflow_sqlite/repository.py` | 1270 | The adapter |
-| `workflow_sqlite/schema.py` | 188 | 25 tables, 13 indexes |
+| `workflow_sqlite/repository.py` | 1433 | The adapter |
+| `workflow_sqlite/schema.py` | 206 | 25 tables, 15 indexes, the migration chain |
 | `workflow-api/app/main.py` | 216 | HTTP endpoints |
 | `workflow-api/app/security.py` | 49 | Identity from a trusted header |
 
@@ -564,7 +569,7 @@ A client may pass `expected_revision`. A mismatch is a `ConflictError` with no
 partial write (`REL-3`). The revision increments once per command, after the
 driver settles.
 
-## 25. Events and the outbox
+## 25. One event log, one outbox
 
 Every runtime change writes an ordered event and an outbox row in the same
 transaction (`REL-4`, `REL-5`). Sequence numbers are dense and unique per
@@ -573,7 +578,7 @@ workflow, which is what makes a consumer able to detect a gap.
 ~~~text
 BEGIN
   update runtime state
-  append workflow_event   (sequence_number = max + 1)
+  append event_log        (sequence_number = max + 1 for this aggregate)
   insert outbox_event     (same event_id, full envelope)
   record the command receipt
 COMMIT
@@ -596,7 +601,62 @@ every healthy one on each retry.
 Signing secrets are write-only. Only the delivery worker reads them back; no
 read interface returns one (`OPS-5`).
 
-## 26. The inbox
+### The host shares both
+
+An embedding host has domain events of its own, and the obvious thing is for it
+to build a second event table, a second outbox and a second delivery worker
+beside Flow's. That doubles the operational surface of a system whose whole
+argument is having fewer moving parts, and it gives two orderings that cannot be
+reconciled.
+
+So the log is not workflow-scoped. It is scoped by aggregate, and Flow is one
+aggregate type among the host's (`EMB-14`):
+
+~~~text
+event_log
+  aggregate_type   aggregate_id   sequence_number   event_type
+  WORKFLOW         42             7                 STEP_COMPLETE
+  ISRP_ASSESSMENT  ASMT-1002      3                 RESPONSE_SUBMITTED
+  ISRP_FINDING     FND-9          1                 FINDING_CREATED
+~~~
+
+`UNIQUE(aggregate_type, aggregate_id, sequence_number)` keeps each stream dense
+independently, so gap detection works for the host's events exactly as it does
+for Flow's. The workflow foreign key is retained as a nullable column, so Flow's
+own rows stay referentially safe while a host row that has no workflow is still
+welcome.
+
+The host writes through the engine rather than with its own SQL, because
+sequence allocation and the event-to-outbox pairing are the two things that must
+not be reimplemented:
+
+~~~python
+engine.record_event(
+    "ISRP_ASSESSMENT", "ASMT-1002", "RESPONSE_SUBMITTED",
+    actor=current_user, correlation_id="ISR-100", new_revision=4,
+    changed_fields={"response_status": "SUBMITTED"},
+)
+~~~
+
+Called inside the host's transaction, a domain event and a workflow transition
+commit together or not at all (`EMB-15`). The outbox row carries
+`aggregate_type`, `aggregate_id`, `aggregate_version` and `correlation_id`, so
+one delivery worker serves both and a projector can filter to the streams it
+cares about (`EMB-16`).
+
+`WORKFLOW` is reserved. A host that passes it is refused, because a second
+writer allocating sequence numbers in Flow's own stream would corrupt the
+ordering Flow depends on (`EMB-18`).
+
+One consequence worth stating: Flow's composite key is
+`(aggregate, sequence)`, not the `(aggregate, version, event_type)` a host might
+use to guarantee emit-once. Flow emits several events at one revision — a single
+drive can activate three nodes — so that constraint cannot hold globally. A host
+wanting emit-once derives `event_id` deterministically from its own key instead;
+`UNIQUE(event_id)` then gives the identical guarantee without constraining
+Flow.
+
+## 26. One inbox
 
 Provider events are deduplicated on `connector_name + provider_event_id`, then
 translated into signals through the same idempotent command path (`EVT-8`,
@@ -607,6 +667,13 @@ Signals are durable and order-independent. One arriving before its `WAIT_SIGNAL`
 node activates is stored and consumed when the node appears; one arriving while
 the node waits is consumed immediately; either way exactly once (`EVT-5`,
 `EVT-6`).
+
+The host shares this table too (`EMB-17`). `record_inbox_event` accepts a
+provider event that has not yet been correlated to any workflow, which
+`ingest_external_event` cannot, and `claim_inbox_events` lets one connector
+runner drain receipts for the host and for Flow alike. The deduplication key is
+the same either way, so a provider that delivers one event twice is absorbed
+once regardless of which side consumes it.
 
 ## 27. Claiming
 
@@ -706,7 +773,7 @@ delivery.
 
 ## 33. Schema
 
-25 tables, 13 indexes.
+25 tables, 15 indexes.
 
 ~~~text
 definitions   fsm_definition fsm_version fsm_state_definition
@@ -718,11 +785,14 @@ runtime       workflow_instance workflow_subject workflow_fact_history
 
 async         signal_receipt automation_job durable_timer
 
-reliability   workflow_event workflow_command inbox_event outbox_event
+reliability   event_log workflow_command inbox_event outbox_event
               webhook_subscription outbox_delivery
 
 meta          schema_metadata
 ~~~
+
+The three shared with an embedding host are `event_log`, `outbox_event` and
+`inbox_event`. See section 25.
 
 Conventions, chosen for portability to Oracle:
 
@@ -867,9 +937,10 @@ the service shell, or a different tool.
 3. The operator console is still the original single-file React application. It
    hardcodes the default FSM's actions, so a custom step FSM renders no buttons,
    and it does not use the work queue or operations endpoints.
-4. The ISRP documents under `docs/isrp/` describe PostgreSQL as the first
-   production store. The charter has since decided Oracle. Those documents have
-   not been revised.
+4. Three things the ISRP design assumes are not in Flow: `BLOCKED` as an
+   execution category, an execution-mode field that publication can validate,
+   and an FSM transition that returns to the previous state. Each is recorded
+   as an open dependency in `docs/isrp/architecture.md` with a workaround.
 
 ## Traceability
 

@@ -10,10 +10,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from workflow_core.actor import Actor
-from workflow_core.errors import ConflictError
+from .actor import Actor
+from .states import (
+    ASSESSMENT, DEFAULT_EXECUTION_MODE, Owner, REQUEST, resolve_execution_mode,
+)
+from .errors import ConflictError, ValidationError
 
-from .schema import EVENT_SCHEMA_VERSION, INDEXES, SCHEMA, SCHEMA_VERSION
+from .schema import (
+    EVENT_SCHEMA_VERSION, INDEXES, MIGRATIONS, SCHEMA, SCHEMA_VERSION, TABLES,
+)
 
 
 DEFAULT_LIFECYCLE_FSM = {
@@ -74,17 +79,52 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-# Every object Flow owns. A host embedding Flow may already have a table called
-# workflow_instance, so these names can be namespaced with a prefix.
+# Every object this schema owns. Test isolation and the odd shared database
+# namespace them with a prefix, which is rewritten in one place on the way to
+# the database rather than templated into a hundred inline statements.
 FLOW_TABLES = (
     "fsm_definition", "fsm_version", "fsm_state_definition", "fsm_transition_definition",
     "workflow_definition", "workflow_version", "step_definition", "transition_definition",
-    "workflow_instance", "workflow_subject", "workflow_fact_history", "step_instance",
+    "isrp_request", "isrp_assessment", "workflow_fact_history", "step_instance",
     "step_attempt", "work_assignment", "work_candidate", "signal_receipt",
-    "automation_job", "durable_timer", "workflow_event", "workflow_command",
+    "automation_job", "durable_timer", "event_log", "workflow_command",
+    # Names earlier versions used. They are still rewritten so that a prefixed
+    # database can be migrated forward off them.
+    "workflow_instance", "workflow_subject", "workflow_event",
     "inbox_event", "outbox_event", "webhook_subscription", "outbox_delivery",
     "schema_metadata",
 )
+
+# The two aggregates ISRP orchestrates, and the table each one lives in.
+OWNER_TABLES = {REQUEST: "isrp_request", ASSESSMENT: "isrp_assessment"}
+
+
+def owner_table(owner_type: str) -> str:
+    try:
+        return OWNER_TABLES[owner_type]
+    except KeyError:
+        raise ValidationError(
+            f"Unknown owner type {owner_type!r}; ISRP orchestrates "
+            f"{' and '.join(OWNER_TABLES)}") from None
+
+
+def as_owner(value: Any) -> Owner:
+    """Accept ('ISRP_REQUEST', 3) as readily as Owner('ISRP_REQUEST', 3)."""
+    owner = value if isinstance(value, Owner) else Owner(*value)
+    owner_table(owner.type)
+    return owner
+
+
+def running_owner_sql(alias: str) -> str:
+    """SQL that is true when the row's owner aggregate is still running.
+
+    Two owner tables means no single join. An EXISTS per owner type keeps the
+    condition in one place instead of in each of the queries that need it.
+    """
+    return "(" + " OR ".join(
+        f"({alias}.owner_type='{owner_type}' AND EXISTS (SELECT 1 FROM {table} o "
+        f"WHERE o.id={alias}.owner_id AND o.execution_status='RUNNING'))"
+        for owner_type, table in OWNER_TABLES.items()) + ")"
 # Longest first so that no name is a prefix of another match. A trailing word
 # boundary keeps workflow_instance_id from matching workflow_instance.
 _FLOW_OBJECT = re.compile(
@@ -119,13 +159,7 @@ class _PrefixedConnection:
         return getattr(self._connection, name)
 
 
-TERMINAL_PROJECTION = {"COMPLETED": "COMPLETED", "CANCELLED": "CANCELLED", "FAILED": "FAILED"}
 TERMINAL_STEP_EXECUTION = ("COMPLETED", "SKIPPED", "FAILED", "CANCELLED")
-
-
-def project_status(execution_status: str) -> str:
-    """Compatibility projection of execution status onto the legacy status field."""
-    return TERMINAL_PROJECTION.get(execution_status, "ACTIVE")
 
 
 def redact_subscription(row: dict[str, Any]) -> dict[str, Any]:
@@ -146,11 +180,12 @@ def decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 class SQLiteWorkflowRepository:
     def __init__(self, path: str | Path | None = None, table_prefix: str = ""):
-        """Standalone with a path; embedded with none.
+        """Standalone with a path; bound to a caller's connection with none.
 
-        Embedded, the host binds its own connection with using(), and Flow
-        never opens, commits, rolls back or closes one. A table_prefix
-        namespaces Flow's tables so they cannot collide with the host's.
+        ISRP binds its own connection with using(), and orchestration never
+        opens, commits, rolls back or closes one, so a domain write and a step
+        transition commit as one unit. A table_prefix namespaces the tables,
+        which is how the tests keep runs apart.
         """
         self.path = str(path) if path is not None else None
         self.table_prefix = table_prefix
@@ -185,8 +220,8 @@ class SQLiteWorkflowRepository:
     def initialize(self) -> None:
         """Standalone convenience: open a connection, install the schema, close it.
 
-        An embedding host calls create_schema() from its own migration step
-        instead, so that Flow's tables are versioned alongside the host's.
+        ISRP calls create_schema() from its own migration step instead, so
+        there is one schema with one version stamp rather than two.
         """
         connection = self._connect()
         try:
@@ -195,44 +230,66 @@ class SQLiteWorkflowRepository:
             connection.close()
 
     def create_schema(self, connection: sqlite3.Connection) -> None:
-        """Install or upgrade Flow's tables on a host-supplied connection.
+        """Install or upgrade the schema on a caller-supplied connection.
 
         Safe to call on every start. The legacy 0.2 migration rewrites state
         derived from column values, so it runs only for a populated database
         that predates version stamping, and never again afterwards.
 
         This must not run inside an open transaction: schema changes commit
-        implicitly in SQLite, which would commit whatever the host had in
+        implicitly in SQLite, which would commit whatever the caller had in
         flight alongside them.
         """
         if connection.in_transaction:
             raise RuntimeError(
                 "create_schema cannot run inside an open transaction: DDL commits "
-                "implicitly and would commit the host's uncommitted work with it"
+                "implicitly and would commit the caller's uncommitted work with it"
             )
         wrapped = self._wrap(connection)
         legacy = self._legacy_database(connection)
         wrapped.executescript(SCHEMA)
-        with self.using(connection):
-            lifecycle_id = self._ensure_fsm(DEFAULT_LIFECYCLE_FSM, "WORKFLOW")
-            step_id = self._ensure_fsm(DEFAULT_STEP_FSM, "STEP")
-            if self._schema_version() is None:
-                if legacy:
-                    self._migrate_legacy_schema(lifecycle_id, step_id)
+        # Version 7 rebuilds step_instance, which seven other tables reference.
+        # SQLite rewrites those REFERENCES clauses on rename, and enforces child
+        # rows on drop, only while foreign key enforcement is on. Turning it off
+        # around the chain is the procedure SQLite documents for altering a
+        # referenced table, and the pragma is a no-op inside a transaction, so
+        # it is set here where none is open rather than inside the migration.
+        enforcing = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+        if enforcing:
+            connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self.using(connection):
+                lifecycle_id = self._ensure_fsm(DEFAULT_LIFECYCLE_FSM, "WORKFLOW")
+                step_id = self._ensure_fsm(DEFAULT_STEP_FSM, "STEP")
+                version = self._schema_version()
+                if version is None:
+                    # A fresh database is already at the current shape. Only a
+                    # populated one that predates stamping needs the 0.2
+                    # migration, and it then enters the chain below at zero.
+                    if legacy:
+                        self._migrate_legacy_schema(lifecycle_id, step_id)
+                    version = 0 if legacy else SCHEMA_VERSION
+                for target, method in MIGRATIONS:
+                    if version < target:
+                        getattr(self, method)()
+                        version = target
                 self._stamp_schema_version()
-        connection.commit()
-        # Indexes last: on a legacy database some of them reference columns the
-        # migration has only just added.
+            connection.commit()
+        finally:
+            if enforcing:
+                connection.execute("PRAGMA foreign_keys=ON")
+        # Indexes last: on an older database some of them reference columns and
+        # tables the migration has only just created.
         wrapped.executescript(INDEXES)
         connection.commit()
 
     @contextmanager
     def using(self, connection: sqlite3.Connection) -> Iterator[None]:
-        """Bind a host-owned connection for the duration of the block.
+        """Bind a caller-owned connection for the duration of the block.
 
-        Flow reads and writes through it but never commits, rolls back or
-        closes it. The host decides where the transaction ends, which is what
-        lets a domain write and a workflow transition commit as one unit.
+        Orchestration reads and writes through it but never commits, rolls back
+        or closes it. ISRP decides where the transaction ends, which is what
+        lets a domain write and a step transition commit as one unit.
         """
         if self._connection is not None:
             raise RuntimeError("A connection is already bound on this thread")
@@ -251,6 +308,208 @@ class SQLiteWorkflowRepository:
         prefix = self.table_prefix
         return (f"{prefix}workflow_instance" in tables
                 and f"{prefix}schema_metadata" not in tables)
+
+    def _migrate_to_5_shared_event_log(self) -> None:
+        """One event log, one outbox and one inbox for the host and for Flow.
+
+        The outbox and inbox gain columns. The event log cannot: its workflow
+        column was NOT NULL and its uniqueness was per workflow, neither of
+        which SQLite can alter in place, so rows are copied into the new table
+        and the old one is dropped.
+        """
+        for table, columns in (
+            ("outbox_event", (("aggregate_type", "TEXT"), ("aggregate_id", "TEXT"),
+                              ("aggregate_version", "INTEGER"), ("correlation_id", "TEXT"))),
+            ("inbox_event", (("correlation_id", "TEXT"), ("next_attempt_at", "TEXT"),
+                             ("claimed_by", "TEXT"), ("claimed_at", "TEXT"))),
+        ):
+            existing = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in columns:
+                if name not in existing:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+        present = {row[0] for row in self.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        legacy_name = f"{self.table_prefix}workflow_event"
+        if legacy_name in present:
+            self.db.execute(
+                """INSERT INTO event_log
+                   (event_id,aggregate_type,aggregate_id,sequence_number,
+                    step_instance_id,event_type,actor,actor_org_id,
+                    previous_state,new_state,payload_json,created_at)
+                   SELECT event_id,'WORKFLOW',CAST(workflow_instance_id AS TEXT),
+                          sequence_number,step_instance_id,event_type,
+                          actor,actor_org_id,previous_state,new_state,payload_json,created_at
+                   FROM workflow_event""")
+            self.db.execute("DROP TABLE workflow_event")
+
+    def _migrate_to_6_execution_mode(self) -> None:
+        """Record who performs each step, so publication can police it."""
+        existing = {row["name"] for row in self.db.execute(
+            "PRAGMA table_info(step_definition)")}
+        if "execution_mode" not in existing:
+            self.db.execute("ALTER TABLE step_definition ADD COLUMN execution_mode TEXT")
+        for step_type, mode in DEFAULT_EXECUTION_MODE.items():
+            self.db.execute(
+                """UPDATE step_definition SET execution_mode=?
+                   WHERE step_type=? AND execution_mode IS NULL""", (mode, step_type))
+
+    def _rebuild(self, table: str, columns: str, select: str) -> None:
+        """Replace a table with its current definition, carrying its rows over.
+
+        SQLite cannot drop a column that a unique constraint covers, and every
+        table here is changing both at once, so each is rebuilt rather than
+        altered. The definition is taken from the schema module so that a
+        rebuilt table and a freshly created one cannot drift apart.
+
+        The rename runs under `legacy_alter_table`. Without it SQLite rewrites
+        every other table's REFERENCES clause to follow the renamed table, so
+        the seven tables that point at step_instance would end up pointing at
+        step_instance_prior and keep pointing there after it was dropped. That
+        is not hypothetical: it is what happened the first time this ran, and
+        turning foreign keys off does not prevent it.
+        """
+        old = f"{self.table_prefix}{table}_prior"
+        self.db.execute("PRAGMA legacy_alter_table=ON")
+        self.db.execute(f"ALTER TABLE {table} RENAME TO {old}")
+        self.db.execute("PRAGMA legacy_alter_table=OFF")
+        self.db.execute(TABLES[table])
+        self.db.execute(f"INSERT INTO {table}({columns}) SELECT {select} FROM {old}")
+        self.db.execute(f"DROP TABLE {old}")
+
+    @staticmethod
+    def _owner_type_sql(column: str) -> str:
+        """Which aggregate an old workflow id landed in.
+
+        Ids carry over unchanged, so the table a row is now in is the answer.
+        """
+        return (f"CASE WHEN EXISTS (SELECT 1 FROM isrp_request r WHERE r.id={column}) "
+                f"THEN '{REQUEST}' ELSE '{ASSESSMENT}' END")
+
+    def _migrate_to_7_owner_aggregates(self) -> None:
+        """Fold workflow_instance into the two aggregates ISRP orchestrates.
+
+        A run with no parent becomes a request; a run with a parent becomes an
+        assessment of the request at the root of its tree. A tree deeper than
+        two levels cannot be represented and is flattened onto that same root.
+        That is the only lossy part of this migration, and it is recorded here
+        rather than discovered later: a flattened grandchild also loses its
+        parent step pointer, because that node sits on another assessment and
+        would otherwise be a node the request can never satisfy.
+
+        Ids carry over unchanged. They all came from one sequence, so they stay
+        unique across the two tables, which means every runtime row can find
+        its owner type by asking which table its old id landed in and no id map
+        is needed.
+        """
+        def carries_workflow_id(table: str) -> bool:
+            return any(row["name"] == "workflow_instance_id"
+                       for row in self.db.execute(f"PRAGMA table_info({table})"))
+
+        present = {row[0] for row in self.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        folding = f"{self.table_prefix}workflow_instance" in present
+
+        roots = """WITH RECURSIVE ancestry(id, root_id) AS (
+                       SELECT id, id FROM workflow_instance
+                        WHERE parent_workflow_instance_id IS NULL
+                       UNION ALL
+                       SELECT w.id, a.root_id FROM workflow_instance w
+                         JOIN ancestry a ON a.id = w.parent_workflow_instance_id)"""
+        if folding:
+            self._fold_workflow_instance(roots)
+
+        owner = self._owner_type_sql("workflow_instance_id")
+        for table, columns in (
+            ("step_instance",
+             "id,step_definition_id,iteration_number,state,execution_status,result_json,"
+             "activated_at,started_at,completed_at"),
+            ("workflow_fact_history",
+             "id,fact_key,previous_value_json,new_value_json,source_type,source_reference,"
+             "actor,revision,created_at"),
+            ("signal_receipt",
+             "id,command_id,signal_type,correlation_key,payload_json,received_at,"
+             "consumed_at,consumed_step_instance_id"),
+            ("automation_job",
+             "id,job_key,step_instance_id,handler,status,attempt_count,max_attempts,"
+             "input_json,result_json,available_at,claimed_by,claimed_at,lease_expires_at,"
+             "completed_at,last_error"),
+            ("durable_timer",
+             "id,timer_key,step_instance_id,timer_type,action,due_at,payload_json,"
+             "status,fired_at,cancelled_at"),
+        ):
+            if carries_workflow_id(table):
+                self._rebuild(table, f"owner_type,owner_id,{columns}",
+                              f"{owner},workflow_instance_id,{columns}")
+
+        # A receipt says which aggregate a command hit; the revision it also
+        # carried is informational, because a replay returns current state
+        # rather than a snapshot. Migrated receipts therefore lose it rather
+        # than depending on a JSON extension being compiled in.
+        if carries_workflow_id("workflow_command"):
+            self._rebuild(
+                "workflow_command", "command_id,owner_type,owner_id,action,processed_at",
+                f"command_id,{owner},workflow_instance_id,action,processed_at")
+
+        # The WORKFLOW aggregate type is gone: an execution event belongs to
+        # the request or the assessment it drove, in the same stream as that
+        # aggregate's own domain events. Without a workflow_instance table
+        # there is no parent anywhere to read, so every run was a top-level
+        # one, which is a request.
+        aggregate = (self._owner_type_sql("CAST(aggregate_id AS INTEGER)")
+                     if folding else f"'{REQUEST}'")
+        if carries_workflow_id("event_log"):
+            self._rebuild(
+                "event_log",
+                "id,event_id,aggregate_type,aggregate_id,sequence_number,step_instance_id,"
+                "event_type,actor,actor_org_id,actor_role,correlation_id,command_id,"
+                "previous_state,new_state,previous_revision,new_revision,changed_fields_json,"
+                "reason_reference,source_channel,payload_json,created_at",
+                f"id,event_id,CASE WHEN aggregate_type='WORKFLOW' THEN {aggregate} "
+                "ELSE aggregate_type END,aggregate_id,sequence_number,step_instance_id,"
+                "event_type,actor,actor_org_id,actor_role,correlation_id,command_id,"
+                "previous_state,new_state,previous_revision,new_revision,changed_fields_json,"
+                "reason_reference,source_channel,payload_json,created_at")
+        else:
+            self.db.execute(
+                f"""UPDATE event_log SET aggregate_type={aggregate}
+                    WHERE aggregate_type='WORKFLOW'""")
+        self.db.execute(
+            f"""UPDATE outbox_event SET aggregate_type={aggregate}
+                WHERE aggregate_type='WORKFLOW'""")
+
+        self.db.execute("DROP TABLE IF EXISTS workflow_subject")
+        if folding:
+            self.db.execute("DROP TABLE workflow_instance")
+
+    def _fold_workflow_instance(self, roots: str) -> None:
+        self.db.execute(
+            """INSERT INTO isrp_request
+               (id,workflow_version_id,title,lifecycle_status,execution_status,
+                current_stage,revision,variables_json,created_by,created_at,
+                completed_at,suspended_at,cancelled_at)
+               SELECT id,workflow_version_id,title,lifecycle_state,execution_status,
+                      current_stage,revision,variables_json,created_by,created_at,
+                      completed_at,suspended_at,cancelled_at
+                 FROM workflow_instance WHERE parent_workflow_instance_id IS NULL""")
+        self.db.execute(
+            roots + """
+            INSERT INTO isrp_assessment
+               (id,request_id,assessment_type,parent_step_instance_id,required_flag,
+                workflow_version_id,title,lifecycle_status,execution_status,
+                current_stage,revision,variables_json,created_by,created_at,
+                completed_at,suspended_at,cancelled_at)
+               SELECT w.id,COALESCE(a.root_id,w.parent_workflow_instance_id),
+                      w.relationship_type,
+                      CASE WHEN w.parent_workflow_instance_id
+                                = COALESCE(a.root_id,w.parent_workflow_instance_id)
+                           THEN w.parent_step_instance_id END,
+                      w.required_flag,
+                      w.workflow_version_id,w.title,w.lifecycle_state,w.execution_status,
+                      w.current_stage,w.revision,w.variables_json,w.created_by,w.created_at,
+                      w.completed_at,w.suspended_at,w.cancelled_at
+                 FROM workflow_instance w LEFT JOIN ancestry a ON a.id=w.id
+                WHERE w.parent_workflow_instance_id IS NOT NULL""")
 
     def _schema_version(self) -> int | None:
         row = self.db.execute(
@@ -303,6 +562,11 @@ class SQLiteWorkflowRepository:
         }
         for table, columns in additions.items():
             existing = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            if not existing:
+                # The table is absent, so there is nothing to bring forward.
+                # workflow_event is the case that matters: a 0.2 database has
+                # it, a newer schema creates event_log instead.
+                continue
             for name, ddl in columns:
                 if name not in existing:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
@@ -440,11 +704,12 @@ class SQLiteWorkflowRepository:
             step_ids[step["key"]] = self.db.execute(
                 """INSERT INTO step_definition
                    (workflow_version_id,step_key,name,step_type,stage,description,assignment_role,
-                    join_rule,step_fsm_version_id,configuration_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    join_rule,step_fsm_version_id,configuration_json,execution_mode)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (version_id, step["key"], step["name"], step["type"], step.get("stage", ""),
                  step.get("description", ""), step.get("assignment_role"), step.get("join_rule"),
-                 step_fsm_id, json.dumps(step.get("configuration", {}))),
+                 step_fsm_id, json.dumps(step.get("configuration", {})),
+                 resolve_execution_mode(step["type"], step.get("execution_mode"))),
             ).lastrowid
         for edge in data["transitions"]:
             self.db.execute(
@@ -523,72 +788,64 @@ class SQLiteWorkflowRepository:
     def command_result(self, command_id: str) -> dict[str, Any] | None:
         """The receipt for a command already applied, or None.
 
-        A receipt records which workflow the command hit and the revision it
-        produced. It deliberately does not hold a copy of the workflow: storing
-        a full snapshot per command made command storage grow with the square
-        of the number of commands.
+        A receipt records which aggregate the command hit and the revision it
+        produced. It deliberately does not hold a copy of that aggregate:
+        storing a full snapshot per command made command storage grow with the
+        square of the number of commands.
         """
         row = self.db.execute(
-            "SELECT result_json FROM workflow_command WHERE command_id=?", (command_id,)
-        ).fetchone()
-        return json.loads(row[0]) if row else None
+            """SELECT owner_type,owner_id,action,revision FROM workflow_command
+               WHERE command_id=?""", (command_id,)).fetchone()
+        return dict(row) if row else None
 
-    def record_command(self, command_id: str, workflow_id: int, action: str,
+    def record_command(self, command_id: str, owner: Any, action: str,
                        revision: int | None = None) -> None:
-        receipt = {"workflow_instance_id": workflow_id, "action": action, "revision": revision}
+        owner = as_owner(owner)
         self.db.execute(
-            "INSERT INTO workflow_command(command_id,workflow_instance_id,action,result_json) VALUES (?,?,?,?)",
-            (command_id, workflow_id, action, json.dumps(receipt)),
-        )
+            """INSERT INTO workflow_command(command_id,owner_type,owner_id,action,revision)
+               VALUES (?,?,?,?,?)""",
+            (command_id, owner.type, owner.id, action, revision))
 
-    def create_workflow(self, data: dict[str, Any], version: dict[str, Any]) -> int:
-        lifecycle = self.fsm_initial_state(version["lifecycle_fsm_version_id"])
-        parent_id = data.get("parent_workflow_instance_id")
-        root_id = data.get("root_workflow_instance_id")
-        workflow_id = self.db.execute(
-            """INSERT INTO workflow_instance
-               (workflow_version_id,title,business_type,business_key,correlation_id,lifecycle_state,
-                execution_status,variables_json,parent_workflow_instance_id,root_workflow_instance_id,
-                parent_step_instance_id,relationship_type,relationship_key,required_flag,created_by)
-               VALUES (?,?,?,?,?,?,'RUNNING',?,?,?,?,?,?,?,?)""",
-            (data["workflow_version_id"], data["title"], data.get("business_type"), data.get("business_key"),
-             data.get("correlation_id"), lifecycle, json.dumps(data.get("variables", {})), parent_id,
-             root_id, data.get("parent_step_instance_id"), data.get("relationship_type"),
-             data.get("relationship_key"), bool(data.get("required", True)),
-             Actor.from_value(data.get("actor", "system")).actor_id),
+    def create_aggregate(self, owner_type: str, data: dict[str, Any],
+                         version: dict[str, Any]) -> Owner:
+        """Start a request or an assessment on a published workflow version.
+
+        Only the orchestration columns are written. ISRP's own columns on the
+        same row are its to fill, in the same transaction.
+        """
+        table = owner_table(owner_type)
+        columns: dict[str, Any] = {
+            "workflow_version_id": data["workflow_version_id"],
+            "title": data["title"],
+            "lifecycle_status": self.fsm_initial_state(version["lifecycle_fsm_version_id"]),
+            "variables_json": json.dumps(data.get("variables", {})),
+            "created_by": Actor.from_value(data.get("actor", "system")).actor_id,
+        }
+        if owner_type == ASSESSMENT:
+            columns.update({
+                "request_id": data["request_id"],
+                "assessment_type": data.get("assessment_type"),
+                "parent_step_instance_id": data.get("parent_step_instance_id"),
+                "required_flag": bool(data.get("required", True)),
+            })
+        names = ",".join(columns)
+        new_id = self.db.execute(
+            f"INSERT INTO {table}({names}) VALUES ({','.join('?' * len(columns))})",
+            tuple(columns.values()),
         ).lastrowid
-        if root_id is None:
-            resolved_root = workflow_id
-            if parent_id:
-                parent = self.db.execute(
-                    "SELECT root_workflow_instance_id FROM workflow_instance WHERE id=?", (parent_id,)
-                ).fetchone()
-                resolved_root = parent[0] if parent else workflow_id
-            self.db.execute(
-                "UPDATE workflow_instance SET root_workflow_instance_id=? WHERE id=?",
-                (resolved_root, workflow_id),
-            )
-        return workflow_id
+        return Owner(owner_type, new_id)
 
-    def add_subjects(self, workflow_id: int, subjects: list[dict[str, Any]]) -> None:
-        for subject in subjects:
-            self.db.execute(
-                """INSERT INTO workflow_subject
-                   (workflow_instance_id,subject_type,subject_id,source_system,relationship)
-                   VALUES (?,?,?,?,?)""",
-                (workflow_id, subject["subject_type"], subject["subject_id"], subject["source_system"],
-                 subject.get("relationship", "PRIMARY")),
-            )
-
-    def create_step_instances(self, workflow_id: int, version_id: int) -> None:
+    def create_step_instances(self, owner: Any, version_id: int) -> None:
+        owner = as_owner(owner)
         for row in self.db.execute(
             "SELECT id,step_fsm_version_id FROM step_definition WHERE workflow_version_id=?", (version_id,)
         ):
             initial = self.fsm_initial_state(row["step_fsm_version_id"])
             self.db.execute(
                 """INSERT INTO step_instance
-                   (workflow_instance_id,step_definition_id,state,execution_status)
-                   VALUES (?,?,?,'NOT_READY')""", (workflow_id, row["id"], initial),
+                   (owner_type,owner_id,step_definition_id,state,execution_status)
+                   VALUES (?,?,?,?,'NOT_READY')""",
+                (owner.type, owner.id, row["id"], initial),
             )
 
     def fsm_has_state(self, fsm_version_id: int, state: str) -> bool:
@@ -597,18 +854,19 @@ class SQLiteWorkflowRepository:
             (fsm_version_id, state),
         ).fetchone() is not None
 
-    def remap_step_instances(self, workflow_id: int, target_version_id: int) -> dict[str, int]:
-        """Repoint a workflow's nodes at another version's definitions, by step key.
+    def remap_step_instances(self, owner: Any, target_version_id: int) -> dict[str, int]:
+        """Repoint an aggregate's nodes at another version's definitions, by step key.
 
         Step key is the identity that survives a version change: node ids do
         not, and node order certainly does not. A node whose key exists in both
         versions keeps its state; one that has been removed is retired; one
         that is new starts unready.
         """
+        owner = as_owner(owner)
         current = {row["step_key"]: dict(row) for row in self.db.execute(
             """SELECT si.id,si.execution_status,sd.step_key
                FROM step_instance si JOIN step_definition sd ON sd.id=si.step_definition_id
-               WHERE si.workflow_instance_id=?""", (workflow_id,))}
+               WHERE si.owner_type=? AND si.owner_id=?""", (owner.type, owner.id))}
         target = {row["step_key"]: dict(row) for row in self.db.execute(
             """SELECT id,step_key,step_fsm_version_id FROM step_definition
                WHERE workflow_version_id=?""", (target_version_id,))}
@@ -631,52 +889,57 @@ class SQLiteWorkflowRepository:
             if key not in current:
                 self.db.execute(
                     """INSERT INTO step_instance
-                       (workflow_instance_id,step_definition_id,state,execution_status)
-                       VALUES (?,?,?,'NOT_READY')""",
-                    (workflow_id, row["id"], self.fsm_initial_state(row["step_fsm_version_id"])))
+                       (owner_type,owner_id,step_definition_id,state,execution_status)
+                       VALUES (?,?,?,?,'NOT_READY')""",
+                    (owner.type, owner.id, row["id"],
+                     self.fsm_initial_state(row["step_fsm_version_id"])))
                 summary["added"] += 1
         return summary
 
-    def get_instance_row(self, workflow_id: int) -> dict[str, Any] | None:
-        return decode(self.db.execute("SELECT * FROM workflow_instance WHERE id=?", (workflow_id,)).fetchone())
+    def get_aggregate_row(self, owner: Any) -> dict[str, Any] | None:
+        """One aggregate's own row, with the owner type it was read under."""
+        owner = as_owner(owner)
+        row = decode(self.db.execute(
+            f"SELECT * FROM {owner_table(owner.type)} WHERE id=?", (owner.id,)).fetchone())
+        if row is not None:
+            row["owner_type"] = owner.type
+        return row
 
-    def list_workflows(self) -> list[dict[str, Any]]:
+    def list_aggregates(self, owner_type: str) -> list[dict[str, Any]]:
         with self.transaction():
-            items = [decode(row) for row in self.db.execute(
-                """SELECT wi.*,wd.name workflow_name FROM workflow_instance wi
-                   JOIN workflow_version wv ON wv.id=wi.workflow_version_id
-                   JOIN workflow_definition wd ON wd.id=wv.definition_id ORDER BY wi.id DESC"""
+            return [dict(decode(row), owner_type=owner_type) for row in self.db.execute(
+                f"""SELECT a.*,wd.name workflow_name FROM {owner_table(owner_type)} a
+                    JOIN workflow_version wv ON wv.id=a.workflow_version_id
+                    JOIN workflow_definition wd ON wd.id=wv.definition_id ORDER BY a.id DESC"""
             )]
-            for item in items:
-                item["status"] = project_status(item["execution_status"])
-            return items
 
-    def get_workflow(self, workflow_id: int) -> dict[str, Any] | None:
+    def get_aggregate(self, owner: Any) -> dict[str, Any] | None:
+        owner = as_owner(owner)
         context = self.transaction() if self._connection is None else _null_context()
         with context:
-            workflow = decode(self.db.execute(
-                """SELECT wi.*,wd.name workflow_name,wv.version_number,wv.lifecycle_fsm_version_id
-                   FROM workflow_instance wi JOIN workflow_version wv ON wv.id=wi.workflow_version_id
-                   JOIN workflow_definition wd ON wd.id=wv.definition_id WHERE wi.id=?""",
-                (workflow_id,),
+            aggregate = decode(self.db.execute(
+                f"""SELECT a.*,wd.name workflow_name,wv.version_number,wv.lifecycle_fsm_version_id
+                    FROM {owner_table(owner.type)} a
+                    JOIN workflow_version wv ON wv.id=a.workflow_version_id
+                    JOIN workflow_definition wd ON wd.id=wv.definition_id WHERE a.id=?""",
+                (owner.id,),
             ).fetchone())
-            if not workflow:
+            if not aggregate:
                 return None
-            workflow["status"] = project_status(workflow["execution_status"])
-            workflow["subjects"] = [decode(row) for row in self.db.execute(
-                "SELECT * FROM workflow_subject WHERE workflow_instance_id=?", (workflow_id,)
-            )]
-            workflow["children"] = [decode(row) for row in self.db.execute(
-                """SELECT id,title,business_type,business_key,lifecycle_state,execution_status,
-                   parent_step_instance_id,relationship_type,relationship_key,required_flag
-                   FROM workflow_instance WHERE parent_workflow_instance_id=? ORDER BY id""", (workflow_id,)
-            )]
-            workflow["steps"] = []
+            aggregate["owner_type"] = owner.type
+            aggregate["assessments"] = [decode(row) for row in self.db.execute(
+                """SELECT id,title,assessment_type,lifecycle_status,execution_status,
+                   parent_step_instance_id,required_flag
+                   FROM isrp_assessment WHERE request_id=? ORDER BY id""", (owner.id,)
+            )] if owner.type == REQUEST else []
+            aggregate["steps"] = []
             for row in self.db.execute(
                 """SELECT si.*,sd.step_key,sd.name,sd.step_type,sd.stage,sd.description,
-                   sd.assignment_role,sd.join_rule,sd.step_fsm_version_id,sd.configuration_json
+                   sd.assignment_role,sd.join_rule,sd.execution_mode,sd.step_fsm_version_id,
+                   sd.configuration_json
                    FROM step_instance si JOIN step_definition sd ON sd.id=si.step_definition_id
-                   WHERE si.workflow_instance_id=? ORDER BY sd.id""", (workflow_id,)
+                   WHERE si.owner_type=? AND si.owner_id=? ORDER BY sd.id""",
+                (owner.type, owner.id),
             ):
                 step = decode(row)
                 step["assignments"] = [decode(item) for item in self.db.execute(
@@ -685,12 +948,12 @@ class SQLiteWorkflowRepository:
                 step["candidates"] = [decode(item) for item in self.db.execute(
                     "SELECT * FROM work_candidate WHERE step_instance_id=? ORDER BY id", (row["id"],)
                 )]
-                workflow["steps"].append(step)
-            workflow["events"] = [decode(row) for row in self.db.execute(
-                "SELECT * FROM workflow_event WHERE workflow_instance_id=? ORDER BY sequence_number DESC",
-                (workflow_id,),
+                aggregate["steps"].append(step)
+            aggregate["events"] = [decode(row) for row in self.db.execute(
+                """SELECT * FROM event_log WHERE aggregate_type=? AND aggregate_id=?
+                   ORDER BY sequence_number DESC""", (owner.type, str(owner.id)),
             )]
-            return workflow
+            return aggregate
 
     def get_step(self, step_id: int) -> dict[str, Any] | None:
         return decode(self.db.execute(
@@ -700,23 +963,27 @@ class SQLiteWorkflowRepository:
                WHERE si.id=?""", (step_id,),
         ).fetchone())
 
-    def list_steps_by_execution(self, workflow_id: int, status: str) -> list[dict[str, Any]]:
+    def list_steps_by_execution(self, owner: Any, status: str) -> list[dict[str, Any]]:
+        owner = as_owner(owner)
         return [decode(row) for row in self.db.execute(
             """SELECT si.*,sd.step_key,sd.step_type,sd.stage,sd.assignment_role,sd.join_rule,
                sd.step_fsm_version_id,sd.configuration_json
                FROM step_instance si JOIN step_definition sd ON sd.id=si.step_definition_id
-               WHERE si.workflow_instance_id=? AND si.execution_status=?""", (workflow_id, status),
+               WHERE si.owner_type=? AND si.owner_id=? AND si.execution_status=?""",
+            (owner.type, owner.id, status),
         )]
 
-    def incoming(self, workflow_id: int, step_definition_id: int) -> list[dict[str, Any]]:
+    def incoming(self, owner: Any, step_definition_id: int) -> list[dict[str, Any]]:
+        owner = as_owner(owner)
         return [decode(row) for row in self.db.execute(
             """SELECT td.condition_json,pred.execution_status,pred.state,
                       pred.id step_instance_id,sd.configuration_json
                FROM transition_definition td
                JOIN step_instance pred
-                 ON pred.step_definition_id=td.from_step_id AND pred.workflow_instance_id=?
+                 ON pred.step_definition_id=td.from_step_id
+                AND pred.owner_type=? AND pred.owner_id=?
                JOIN step_definition sd ON sd.id=td.from_step_id
-               WHERE td.to_step_id=?""", (workflow_id, step_definition_id),
+               WHERE td.to_step_id=?""", (owner.type, owner.id, step_definition_id),
         )]
 
     def update_step(self, step_id: int, values: dict[str, Any]) -> None:
@@ -726,30 +993,34 @@ class SQLiteWorkflowRepository:
         sql = ",".join(f"{key}=?" for key in values)
         self.db.execute(f"UPDATE step_instance SET {sql} WHERE id=?", (*values.values(), step_id))
 
-    def update_workflow(self, workflow_id: int, values: dict[str, Any]) -> None:
+    def update_aggregate(self, owner: Any, values: dict[str, Any]) -> None:
+        owner = as_owner(owner)
         values = dict(values)
         if "variables" in values:
             values["variables_json"] = json.dumps(values.pop("variables"))
         sql = ",".join(f"{key}=?" for key in values)
-        self.db.execute(f"UPDATE workflow_instance SET {sql} WHERE id=?", (*values.values(), workflow_id))
+        self.db.execute(
+            f"UPDATE {owner_table(owner.type)} SET {sql} WHERE id=?",
+            (*values.values(), owner.id))
 
-    def set_facts(self, workflow: dict[str, Any], facts: dict[str, Any], actor: str,
+    def set_facts(self, aggregate: dict[str, Any], facts: dict[str, Any], actor: str,
                   source_type: str, source_reference: str | None) -> None:
-        current = dict(workflow["variables"])
-        revision = workflow["revision"] + 1
+        owner = Owner(aggregate["owner_type"], aggregate["id"])
+        current = dict(aggregate["variables"])
+        revision = aggregate["revision"] + 1
         for key, value in facts.items():
             previous = current.get(key)
             if previous == value:
                 continue
             self.db.execute(
                 """INSERT INTO workflow_fact_history
-                   (workflow_instance_id,fact_key,previous_value_json,new_value_json,
-                    source_type,source_reference,actor,revision) VALUES (?,?,?,?,?,?,?,?)""",
-                (workflow["id"], key, json.dumps(previous), json.dumps(value),
+                   (owner_type,owner_id,fact_key,previous_value_json,new_value_json,
+                    source_type,source_reference,actor,revision) VALUES (?,?,?,?,?,?,?,?,?)""",
+                (owner.type, owner.id, key, json.dumps(previous), json.dumps(value),
                  source_type, source_reference, actor, revision),
             )
             current[key] = value
-        self.update_workflow(workflow["id"], {"variables": current, "revision": revision})
+        self.update_aggregate(owner, {"variables": current, "revision": revision})
 
     def create_candidates(self, step_id: int, candidates: list[dict[str, Any]]) -> None:
         for item in candidates:
@@ -811,12 +1082,13 @@ class SQLiteWorkflowRepository:
             (outcome, json.dumps(result), step_id, iteration),
         )
 
-    def insert_signal(self, command: dict[str, Any], workflow_id: int) -> None:
+    def insert_signal(self, command: dict[str, Any], owner: Any) -> None:
+        owner = as_owner(owner)
         self.db.execute(
             """INSERT INTO signal_receipt
-               (command_id,workflow_instance_id,signal_type,correlation_key,payload_json)
-               VALUES (?,?,?,?,?)""",
-            (command["command_id"], workflow_id, command["signal_type"],
+               (command_id,owner_type,owner_id,signal_type,correlation_key,payload_json)
+               VALUES (?,?,?,?,?,?)""",
+            (command["command_id"], owner.type, owner.id, command["signal_type"],
              command.get("correlation_key"), json.dumps(command.get("payload", {}))),
         )
 
@@ -843,12 +1115,13 @@ class SQLiteWorkflowRepository:
             ("PROCESSED" if error is None else "FAILED", error, error, inbox_id),
         )
 
-    def unconsumed_signal(self, workflow_id: int, signal_type: str,
+    def unconsumed_signal(self, owner: Any, signal_type: str,
                           correlation_key: str | None) -> dict[str, Any] | None:
+        owner = as_owner(owner)
         return decode(self.db.execute(
-            """SELECT * FROM signal_receipt WHERE workflow_instance_id=? AND signal_type=?
+            """SELECT * FROM signal_receipt WHERE owner_type=? AND owner_id=? AND signal_type=?
                AND (? IS NULL OR correlation_key=?) AND consumed_at IS NULL ORDER BY id LIMIT 1""",
-            (workflow_id, signal_type, correlation_key, correlation_key),
+            (owner.type, owner.id, signal_type, correlation_key, correlation_key),
         ).fetchone())
 
     def consume_signal(self, signal_id: int, step_id: int) -> None:
@@ -857,13 +1130,15 @@ class SQLiteWorkflowRepository:
                WHERE id=? AND consumed_at IS NULL""", (step_id, signal_id),
         )
 
-    def create_automation_job(self, workflow_id: int, step: dict[str, Any]) -> None:
+    def create_automation_job(self, owner: Any, step: dict[str, Any]) -> None:
+        owner = as_owner(owner)
         config = step.get("configuration", {})
         self.db.execute(
             """INSERT OR IGNORE INTO automation_job
-               (job_key,workflow_instance_id,step_instance_id,handler,max_attempts,input_json)
-               VALUES (?,?,?,?,?,?)""",
-            (f"{workflow_id}:{step['id']}:{step['iteration_number']}", workflow_id, step["id"],
+               (job_key,owner_type,owner_id,step_instance_id,handler,max_attempts,input_json)
+               VALUES (?,?,?,?,?,?,?)""",
+            (f"{owner.type}:{owner.id}:{step['id']}:{step['iteration_number']}",
+             owner.type, owner.id, step["id"],
              config.get("handler", "default"), int(config.get("max_attempts", 3)),
              json.dumps(config.get("input", {}))),
         )
@@ -871,12 +1146,11 @@ class SQLiteWorkflowRepository:
     def claim_jobs(self, worker_id: str, limit: int = 10, lease_seconds: int = 60) -> list[dict[str, Any]]:
         now, lease = utcnow(), (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
         rows = list(self.db.execute(
-            """SELECT j.id FROM automation_job j
-               JOIN workflow_instance w ON w.id=j.workflow_instance_id
-               WHERE w.execution_status='RUNNING' AND (
-                   (j.status IN ('QUEUED','RETRY_WAIT') AND j.available_at<=?)
-                   OR (j.status='RUNNING' AND j.lease_expires_at<?))
-               ORDER BY j.id LIMIT ?""",
+            f"""SELECT j.id FROM automation_job j
+                WHERE {running_owner_sql('j')} AND (
+                    (j.status IN ('QUEUED','RETRY_WAIT') AND j.available_at<=?)
+                    OR (j.status='RUNNING' AND j.lease_expires_at<?))
+                ORDER BY j.id LIMIT ?""",
             (now, now, limit),
         ))
         result = []
@@ -912,7 +1186,7 @@ class SQLiteWorkflowRepository:
         sql = ",".join(f"{key}=?" for key in values)
         self.db.execute(f"UPDATE automation_job SET {sql} WHERE id=?", (*values.values(), job_id))
 
-    def create_timer(self, workflow_id: int, step: dict[str, Any], due_at: str,
+    def create_timer(self, owner: Any, step: dict[str, Any], due_at: str,
                      action: str = "COMPLETE_STEP") -> None:
         """A durable timer for a node.
 
@@ -920,66 +1194,68 @@ class SQLiteWorkflowRepository:
         calendar. The key includes the action so that a node can carry both a
         delay timer and a service-level timer for the same iteration.
         """
+        owner = as_owner(owner)
         config = step.get("configuration", {})
         self.db.execute(
             """INSERT OR IGNORE INTO durable_timer
-               (timer_key,workflow_instance_id,step_instance_id,timer_type,action,due_at,payload_json)
-               VALUES (?,?,?,'RELATIVE',?,?,?)""",
-            (f"{workflow_id}:{step['id']}:{step['iteration_number']}:{action}",
-             workflow_id, step["id"], action, due_at,
+               (timer_key,owner_type,owner_id,step_instance_id,timer_type,action,due_at,payload_json)
+               VALUES (?,?,?,?,'RELATIVE',?,?,?)""",
+            (f"{owner.type}:{owner.id}:{step['id']}:{step['iteration_number']}:{action}",
+             owner.type, owner.id, step["id"], action, due_at,
              json.dumps(config.get("payload", {}))),
         )
 
     def due_timers(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Due timers for running workflows only.
+        """Due timers for running aggregates only.
 
-        A suspended workflow leaves its timers scheduled so that they fire once
-        it resumes, rather than advancing a workflow that is meant to be idle.
+        A suspended request or assessment leaves its timers scheduled so that
+        they fire once it resumes, rather than advancing something that is
+        meant to be idle.
         """
         return [decode(row) for row in self.db.execute(
-            """SELECT t.* FROM durable_timer t
-               JOIN workflow_instance w ON w.id=t.workflow_instance_id
-               WHERE t.status='SCHEDULED' AND t.due_at<=? AND w.execution_status='RUNNING'
-               ORDER BY t.due_at,t.id LIMIT ?""", (utcnow(), limit),
+            f"""SELECT t.* FROM durable_timer t
+                WHERE t.status='SCHEDULED' AND t.due_at<=? AND {running_owner_sql('t')}
+                ORDER BY t.due_at,t.id LIMIT ?""", (utcnow(), limit),
         )]
 
-    def cancel_open_work(self, workflow_id: int) -> None:
-        """Cancel every unfinished node, timer, job and assignment of a workflow.
+    def cancel_open_work(self, owner: Any) -> None:
+        """Cancel every unfinished node, timer, job and assignment of an aggregate.
 
         Execution status is the engine-controlled dimension, so it is the one
         set here. The FSM-controlled node state is left untouched, because a
         custom step FSM need not declare a cancelled state.
         """
+        owner = as_owner(owner)
         stamp = utcnow()
         placeholders = ",".join("?" * len(TERMINAL_STEP_EXECUTION))
         self.db.execute(
             f"""UPDATE step_instance SET execution_status='CANCELLED',completed_at=?
-                WHERE workflow_instance_id=?
+                WHERE owner_type=? AND owner_id=?
                 AND execution_status NOT IN ({placeholders})""",
-            (stamp, workflow_id, *TERMINAL_STEP_EXECUTION),
+            (stamp, owner.type, owner.id, *TERMINAL_STEP_EXECUTION),
         )
         self.db.execute(
             """UPDATE durable_timer SET status='CANCELLED',cancelled_at=?
-               WHERE workflow_instance_id=? AND status='SCHEDULED'""",
-            (stamp, workflow_id),
+               WHERE owner_type=? AND owner_id=? AND status='SCHEDULED'""",
+            (stamp, owner.type, owner.id),
         )
         self.db.execute(
             """UPDATE automation_job SET status='CANCELLED',completed_at=?,lease_expires_at=NULL
-               WHERE workflow_instance_id=? AND status IN ('QUEUED','RETRY_WAIT','RUNNING')""",
-            (stamp, workflow_id),
+               WHERE owner_type=? AND owner_id=? AND status IN ('QUEUED','RETRY_WAIT','RUNNING')""",
+            (stamp, owner.type, owner.id),
         )
         self.db.execute(
             """UPDATE work_assignment SET status='CANCELLED',ended_at=?
                WHERE status='OPEN' AND step_instance_id IN
-               (SELECT id FROM step_instance WHERE workflow_instance_id=?)""",
-            (stamp, workflow_id),
+               (SELECT id FROM step_instance WHERE owner_type=? AND owner_id=?)""",
+            (stamp, owner.type, owner.id),
         )
 
-    def running_child_ids(self, workflow_id: int) -> list[int]:
+    def running_assessment_ids(self, request_id: int) -> list[int]:
         return [row[0] for row in self.db.execute(
-            """SELECT id FROM workflow_instance
-               WHERE parent_workflow_instance_id=? AND execution_status='RUNNING'
-               ORDER BY id""", (workflow_id,),
+            """SELECT id FROM isrp_assessment
+               WHERE request_id=? AND execution_status='RUNNING' ORDER BY id""",
+            (request_id,),
         )]
 
     def fire_timer(self, timer_id: int) -> None:
@@ -988,49 +1264,175 @@ class SQLiteWorkflowRepository:
             (timer_id,),
         )
 
-    def append_event(self, workflow_id: int, event_type: str, actor: str,
+    def _correlation(self, owner: Owner) -> str:
+        """One correlation id for a request and every assessment under it.
+
+        A reviewer's determination on an assessment and the step transition it
+        caused in the request belong to one investigation, so they carry one
+        correlation id even though they are two aggregates.
+        """
+        if owner.type == REQUEST:
+            return f"{REQUEST}:{owner.id}"
+        row = self.db.execute(
+            "SELECT request_id FROM isrp_assessment WHERE id=?", (owner.id,)).fetchone()
+        return f"{REQUEST}:{row['request_id']}" if row else f"{ASSESSMENT}:{owner.id}"
+
+    def _append(self, aggregate_type: str, aggregate_id: str, event_type: str, actor: str,
+                envelope: dict[str, Any], columns: dict[str, Any],
+                publish: bool = True) -> dict[str, Any]:
+        """Write one row to the shared log, and pair it with an outbox row.
+
+        Sequence numbers are per aggregate and computed inside the caller's
+        transaction, which `BEGIN IMMEDIATE` serializes. The outbox row is
+        written here rather than by the caller so that an event can never be
+        recorded without its outbound copy.
+        """
+        event_id = str(columns.pop("event_id", None) or uuid.uuid4())
+        sequence = self.db.execute(
+            """SELECT COALESCE(MAX(sequence_number),0)+1 FROM event_log
+               WHERE aggregate_type=? AND aggregate_id=?""",
+            (aggregate_type, str(aggregate_id)),
+        ).fetchone()[0]
+        row = {
+            "event_id": event_id, "aggregate_type": aggregate_type,
+            "aggregate_id": str(aggregate_id), "sequence_number": sequence,
+            "event_type": event_type, "actor": actor, **columns,
+        }
+        names = ",".join(row)
+        self.db.execute(
+            f"INSERT INTO event_log({names}) VALUES ({','.join('?' * len(row))})",
+            tuple(row.values()),
+        )
+        envelope = {"schema_version": EVENT_SCHEMA_VERSION, "event_id": event_id,
+                    "event_type": event_type, "aggregate_type": aggregate_type,
+                    "aggregate_id": str(aggregate_id), "sequence_number": sequence,
+                    "actor": actor, **envelope}
+        if publish:
+            self.db.execute(
+                """INSERT INTO outbox_event
+                   (event_id,event_type,payload_json,next_attempt_at,
+                    aggregate_type,aggregate_id,aggregate_version,correlation_id)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (event_id, event_type, json.dumps(envelope), utcnow(), aggregate_type,
+                 str(aggregate_id), columns.get("new_revision"), columns.get("correlation_id")),
+            )
+        return {"event_id": event_id, "sequence_number": sequence}
+
+    def append_event(self, owner: Any, event_type: str, actor: str,
                      step_id: int | None = None, previous: str | None = None,
                      new: str | None = None, payload: dict[str, Any] | None = None,
                      actor_org_id: str | None = None) -> None:
-        event_id = str(uuid.uuid4())
-        sequence = self.db.execute(
-            "SELECT COALESCE(MAX(sequence_number),0)+1 FROM workflow_event WHERE workflow_instance_id=?",
-            (workflow_id,),
-        ).fetchone()[0]
-        workflow = self.db.execute(
-            "SELECT business_type,business_key,correlation_id FROM workflow_instance WHERE id=?",
-            (workflow_id,),
-        ).fetchone()
-        event_payload = {
-            "schema_version": EVENT_SCHEMA_VERSION,
-            "event_id": event_id, "event_type": event_type, "workflow_instance_id": workflow_id,
-            "step_instance_id": step_id, "sequence_number": sequence, "actor": actor,
-            "actor_org_id": actor_org_id, "previous_state": previous, "new_state": new,
-            "business_type": workflow["business_type"], "business_key": workflow["business_key"],
-            "correlation_id": workflow["correlation_id"], "payload": payload or {},
-        }
-        self.db.execute(
-            """INSERT INTO workflow_event
-               (event_id,workflow_instance_id,sequence_number,step_instance_id,event_type,actor,
-                actor_org_id,previous_state,new_state,payload_json) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (event_id, workflow_id, sequence, step_id, event_type, actor, actor_org_id,
-             previous, new, json.dumps(payload or {})),
+        """An execution event, on the stream of the aggregate it drove.
+
+        There is no separate aggregate type for execution. A request's own
+        domain events and the orchestration events that moved it sit in one
+        ordered stream, which is what makes a determination and the transition
+        it caused readable side by side.
+        """
+        owner = as_owner(owner)
+        correlation_id = self._correlation(owner)
+        self._append(
+            owner.type, owner.id, event_type, actor,
+            envelope={
+                "step_instance_id": step_id, "actor_org_id": actor_org_id,
+                "previous_state": previous, "new_state": new,
+                "correlation_id": correlation_id, "payload": payload or {},
+            },
+            columns={
+                "step_instance_id": step_id, "actor_org_id": actor_org_id,
+                "previous_state": previous, "new_state": new,
+                "correlation_id": correlation_id,
+                "payload_json": json.dumps(payload or {}),
+            },
         )
-        self.db.execute(
-            """INSERT INTO outbox_event(event_id,event_type,payload_json,next_attempt_at)
-               VALUES (?,?,?,?)""",
-            (event_id, event_type, json.dumps(event_payload), utcnow()),
-        )
+
+    def append_domain_event(self, aggregate_type: str, aggregate_id: str, event_type: str,
+                            actor: str, **fields: Any) -> dict[str, Any]:
+        """A domain event, in the same log and the same transaction as execution.
+
+        Written against the same aggregate the orchestration drives, so there
+        is one ordering, one gap-detection rule and one outbox, rather than a
+        second set of reliability tables beside the first.
+        """
+        payload = fields.pop("payload", None) or {}
+        publish = fields.pop("publish", True)
+        changed = fields.pop("changed_fields", None)
+        columns = {key: value for key, value in {
+            "event_id": fields.pop("event_id", None),
+            "actor_org_id": fields.pop("actor_org_id", None),
+            "actor_role": fields.pop("actor_role", None),
+            "correlation_id": fields.pop("correlation_id", None),
+            "command_id": fields.pop("command_id", None),
+            "previous_revision": fields.pop("previous_revision", None),
+            "new_revision": fields.pop("new_revision", None),
+            "reason_reference": fields.pop("reason_reference", None),
+            "source_channel": fields.pop("source_channel", None),
+            "step_instance_id": fields.pop("step_instance_id", None),
+            "changed_fields_json": json.dumps(changed) if changed is not None else None,
+            "payload_json": json.dumps(payload),
+        }.items() if value is not None}
+        if fields:
+            raise ValidationError(f"Unknown event fields: {', '.join(sorted(fields))}")
+        envelope = {"payload": payload, "correlation_id": columns.get("correlation_id")}
+        return self._append(aggregate_type, aggregate_id, event_type, actor,
+                            envelope, columns, publish=publish)
+
+    def list_events(self, aggregate_type: str, aggregate_id: str,
+                    limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
+        with self.transaction():
+            return [decode(row) for row in self.db.execute(
+                """SELECT * FROM event_log WHERE aggregate_type=? AND aggregate_id=?
+                   ORDER BY sequence_number LIMIT ? OFFSET ?""",
+                (aggregate_type, str(aggregate_id), limit, offset))]
+
+    def record_inbox(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Durably receive a provider event, deduplicated per connector.
+
+        Returns the stored row and whether it had been seen before, so a host
+        connector can decide without a second query.
+        """
+        existing = self.inbox_event(event["connector_name"], event["provider_event_id"])
+        if existing:
+            return {"inbox_event": existing, "duplicate": True}
+        inbox_id = self.db.execute(
+            """INSERT INTO inbox_event
+               (connector_name,provider_event_id,event_type,correlation_key,correlation_id,
+                payload_json,next_attempt_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (event["connector_name"], event["provider_event_id"], event["event_type"],
+             event.get("correlation_key"), event.get("correlation_id"),
+             json.dumps(event.get("payload", {})), utcnow()),
+        ).lastrowid
+        return {"inbox_event": decode(self.db.execute(
+            "SELECT * FROM inbox_event WHERE id=?", (inbox_id,)).fetchone()),
+            "duplicate": False}
+
+    def claim_inbox_events(self, worker_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Claim received provider events for processing, guarded like jobs."""
+        with self.transaction():
+            now = utcnow()
+            rows = list(self.db.execute(
+                """SELECT id FROM inbox_event
+                   WHERE status='RECEIVED' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                   ORDER BY id LIMIT ?""", (now, limit)))
+            claimed = []
+            for row in rows:
+                changed = self.db.execute(
+                    """UPDATE inbox_event SET claimed_by=?,claimed_at=?
+                       WHERE id=? AND status='RECEIVED'""", (worker_id, now, row["id"]))
+                if changed.rowcount == 1:
+                    claimed.append(decode(self.db.execute(
+                        "SELECT * FROM inbox_event WHERE id=?", (row["id"],)).fetchone()))
+            return claimed
 
     def list_work(self, assignee: str | None = None, actor: dict[str, Any] | None = None,
                   execution_status: str | None = None, step_type: str | None = None,
-                  business_type: str | None = None, business_key: str | None = None,
-                  workflow_id: int | None = None,
+                  owner_type: str | None = None, owner_id: int | None = None,
                   limit: int = 50, offset: int = 0) -> dict[str, Any]:
         """Open work, filtered and paginated.
 
-        Without this a client had to fetch whole workflows and sift them, which
-        is why the console could not show anyone their own queue.
+        Without this a client had to fetch whole aggregates and sift them,
+        which is why nobody could be shown their own queue.
 
         `assignee` matches an open assignment. `actor` matches the candidate
         rules instead, answering 'what could this person claim' rather than
@@ -1055,25 +1457,32 @@ class SQLiteWorkflowRepository:
                          *memberships, actor.get("organization_id")])
         for column, value in (("si.execution_status", execution_status),
                               ("sd.step_type", step_type),
-                              ("w.business_type", business_type),
-                              ("w.business_key", business_key),
-                              ("w.id", workflow_id)):
+                              ("si.owner_type", owner_type),
+                              ("si.owner_id", owner_id)):
             if value is not None:
                 clauses.append(f"{column}=?")
                 args.append(value)
         where = " AND ".join(clauses)
+        # Two owner tables, so an outer join to each and a coalesce rather than
+        # one join. The owner columns on step_instance decide which side is
+        # populated, so exactly one of the two ever matches.
         source = """FROM step_instance si
                     JOIN step_definition sd ON sd.id=si.step_definition_id
-                    JOIN workflow_instance w ON w.id=si.workflow_instance_id"""
+                    LEFT JOIN isrp_request rq
+                      ON si.owner_type='ISRP_REQUEST' AND rq.id=si.owner_id
+                    LEFT JOIN isrp_assessment asmt
+                      ON si.owner_type='ISRP_ASSESSMENT' AND asmt.id=si.owner_id"""
         with self.transaction():
             total = int(self.db.execute(
                 f"SELECT COUNT(*) {source} WHERE {where}", args).fetchone()[0])
             rows = [decode(row) for row in self.db.execute(
                 f"""SELECT si.id step_instance_id,si.state,si.execution_status,
                            si.iteration_number,si.activated_at,si.started_at,
+                           si.owner_type,si.owner_id,
                            sd.step_key,sd.name,sd.step_type,sd.stage,sd.assignment_role,
-                           w.id workflow_instance_id,w.title,w.business_type,
-                           w.business_key,w.correlation_id,w.lifecycle_state
+                           sd.execution_mode,
+                           COALESCE(rq.title,asmt.title) title,
+                           COALESCE(rq.lifecycle_status,asmt.lifecycle_status) lifecycle_status
                     {source} WHERE {where}
                     ORDER BY si.activated_at,si.id LIMIT ? OFFSET ?""",
                 (*args, limit, offset))]
@@ -1084,29 +1493,32 @@ class SQLiteWorkflowRepository:
                     (row["step_instance_id"],))]
         return {"items": rows, "total": total, "limit": limit, "offset": offset}
 
-    def stuck_workflows(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Running workflows with nothing that can advance them.
+    def stuck_aggregates(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Running requests and assessments with nothing that can advance them.
 
         No node ready, active or waiting; no job queued or running; no timer
-        scheduled. Such a workflow is not slow, it is wedged, and nothing else
-        in the system will say so.
+        scheduled. Such a run is not slow, it is wedged, and nothing else in
+        the system will say so. The limit is applied per owner type and then to
+        the combined result, so a flood of one kind cannot hide the other.
         """
         with self.transaction():
-            return [decode(row) for row in self.db.execute(
-                """SELECT w.id,w.title,w.business_type,w.business_key,w.correlation_id,
-                          w.current_stage,w.lifecycle_state,w.created_at
-                   FROM workflow_instance w
-                   WHERE w.execution_status='RUNNING'
-                     AND NOT EXISTS (SELECT 1 FROM step_instance s
-                         WHERE s.workflow_instance_id=w.id
-                           AND s.execution_status IN ('READY','ACTIVE','WAITING'))
-                     AND NOT EXISTS (SELECT 1 FROM automation_job j
-                         WHERE j.workflow_instance_id=w.id
-                           AND j.status IN ('QUEUED','RETRY_WAIT','RUNNING'))
-                     AND NOT EXISTS (SELECT 1 FROM durable_timer t
-                         WHERE t.workflow_instance_id=w.id AND t.status='SCHEDULED')
-                   ORDER BY w.id LIMIT ?""", (limit,),
-            )]
+            found: list[dict[str, Any]] = []
+            for owner_type, table in OWNER_TABLES.items():
+                found.extend(dict(decode(row), owner_type=owner_type) for row in self.db.execute(
+                    f"""SELECT w.id,w.title,w.current_stage,w.lifecycle_status,w.created_at
+                        FROM {table} w
+                        WHERE w.execution_status='RUNNING'
+                          AND NOT EXISTS (SELECT 1 FROM step_instance s
+                              WHERE s.owner_type=? AND s.owner_id=w.id
+                                AND s.execution_status IN ('READY','ACTIVE','WAITING'))
+                          AND NOT EXISTS (SELECT 1 FROM automation_job j
+                              WHERE j.owner_type=? AND j.owner_id=w.id
+                                AND j.status IN ('QUEUED','RETRY_WAIT','RUNNING'))
+                          AND NOT EXISTS (SELECT 1 FROM durable_timer t
+                              WHERE t.owner_type=? AND t.owner_id=w.id AND t.status='SCHEDULED')
+                        ORDER BY w.id LIMIT ?""",
+                    (owner_type, owner_type, owner_type, limit)))
+            return found[:limit]
 
     def dead_letter_events(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.transaction():
@@ -1133,14 +1545,16 @@ class SQLiteWorkflowRepository:
                 return int(self.db.execute(sql, args).fetchone()[0] or 0)
 
             now = utcnow()
+
+            def by_execution(status: str) -> int:
+                return sum(scalar(f"SELECT COUNT(*) FROM {table} WHERE execution_status=?",
+                                  status) for table in OWNER_TABLES.values())
+
             return {
-                "workflows_running": scalar(
-                    "SELECT COUNT(*) FROM workflow_instance WHERE execution_status='RUNNING'"),
-                "workflows_suspended": scalar(
-                    "SELECT COUNT(*) FROM workflow_instance WHERE execution_status='SUSPENDED'"),
-                "workflows_failed": scalar(
-                    "SELECT COUNT(*) FROM workflow_instance WHERE execution_status='FAILED'"),
-                "workflows_stuck": len(self.stuck_workflows(limit=1000)),
+                "aggregates_running": by_execution("RUNNING"),
+                "aggregates_suspended": by_execution("SUSPENDED"),
+                "aggregates_failed": by_execution("FAILED"),
+                "aggregates_stuck": len(self.stuck_aggregates(limit=1000)),
                 "jobs_queued": scalar(
                     "SELECT COUNT(*) FROM automation_job WHERE status IN ('QUEUED','RETRY_WAIT')"),
                 "jobs_running": scalar(

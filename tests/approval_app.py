@@ -1,18 +1,16 @@
-"""A reference application that embeds Flow.
+"""A miniature application with orchestration inside it, used as a test fixture.
 
-This is the shape the charter commits to. There is no workflow service, no
-network hop and no second database. The application owns the connection and
-decides where the transaction ends; Flow joins it.
+It stands in for ISRP: it owns the connection, decides where the transaction
+ends, and calls the orchestration engine inside it. The payoff is the `decide`
+method below, where recording the business decision and advancing the workflow
+are one commit, so the two can never disagree.
 
-The payoff is the `decide` method below. Recording the business decision and
-advancing the workflow are one commit, so the two can never disagree. Across a
-service boundary the same operation needs a saga, a compensating action and a
-reconciliation job.
+That property is the reason this fixture exists. It is what the fused design
+buys and what tests/test_embedding.py holds it to.
 
 Run it:
 
-    PYTHONPATH=packages/workflow-core/src:packages/workflow-sqlite/src \
-        python examples/embedded-host/host.py
+    PYTHONPATH=. python tests/approval_app.py
 """
 
 from __future__ import annotations
@@ -23,19 +21,18 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from workflow_core import WorkflowEngine
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import WorkflowEngine
+from isrp.orchestration import SQLiteWorkflowRepository
 
 
-# The host's own table. workflow_instance_id is a real foreign key, enforced by
-# the database, because Flow's tables live here too. A separate workflow service
-# could only offer an opaque identifier that nothing validates.
+# A stand-in for a domain table. request_id is a real foreign key, enforced by
+# the database, because the orchestration state lives on isrp_request itself.
 DOMAIN_SCHEMA = """
 CREATE TABLE IF NOT EXISTS approval_request (
   reference TEXT PRIMARY KEY,
   title TEXT NOT NULL,
   decision TEXT,
-  workflow_instance_id INTEGER NOT NULL REFERENCES workflow_instance(id),
+  request_id INTEGER NOT NULL REFERENCES isrp_request(id),
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -61,14 +58,14 @@ class HostFailure(RuntimeError):
 
 
 class ApprovalApp:
-    """A small domain application with Flow embedded inside it."""
+    """A small domain application that orchestrates its own work."""
 
     def __init__(self, path: str | Path):
         self.connection = sqlite3.connect(str(path), isolation_level=None, timeout=30.0)
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 30000")
         self.connection.execute("PRAGMA foreign_keys = ON")
-        # No path: this repository never opens a connection of its own.
+        # No path: the store never opens a connection of its own.
         self.repository = SQLiteWorkflowRepository()
         self.engine = WorkflowEngine(self.repository)
         self.workflow_version_id: int | None = None
@@ -109,19 +106,17 @@ class ApprovalApp:
                 if item["key"] == WORKFLOW["key"])
 
     def submit(self, reference: str, title: str) -> int:
-        """Create the business record and its workflow in one commit."""
+        """Create the business record and open its request in one commit."""
         with self.transaction() as connection:
-            workflow = self.engine.start_workflow({
+            workflow = self.engine.start_request({
                 "command_id": f"submit:{reference}",
                 "workflow_version_id": self.workflow_version_id,
                 "title": title,
-                "business_type": "APPROVAL_REQUEST",
-                "business_key": reference,
                 "actor": "approval.app",
-                "variables": {}, "subjects": [],
+                "variables": {},
             })
             connection.execute(
-                """INSERT INTO approval_request(reference,title,workflow_instance_id)
+                """INSERT INTO approval_request(reference,title,request_id)
                    VALUES (?,?,?)""",
                 (reference, title, workflow["id"]),
             )
@@ -135,13 +130,13 @@ class ApprovalApp:
         """
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT workflow_instance_id FROM approval_request WHERE reference=?",
+                "SELECT request_id FROM approval_request WHERE reference=?",
                 (reference,),
             ).fetchone()
             if row is None:
                 raise LookupError(f"No approval request {reference}")
 
-            workflow = self.engine.get_workflow(row["workflow_instance_id"])
+            workflow = self.engine.get_request(row["request_id"])
             step = next(item for item in workflow["steps"]
                         if item["step_key"] == "review")
 
@@ -167,12 +162,12 @@ class ApprovalApp:
         """The business record and its workflow, read together."""
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT decision,workflow_instance_id FROM approval_request WHERE reference=?",
+                "SELECT decision,request_id FROM approval_request WHERE reference=?",
                 (reference,),
             ).fetchone()
             if row is None:
                 return {}
-            workflow = self.engine.get_workflow(row["workflow_instance_id"])
+            workflow = self.engine.get_request(row["request_id"])
             return {
                 "decision": row["decision"],
                 "execution_status": workflow["execution_status"],

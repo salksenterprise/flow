@@ -1,5 +1,10 @@
 # Flow Engine Reference
 
+> **Superseded.** ISRP now owns its orchestration directly; there is no separate
+> workflow engine, service or package. This document described that engine and is
+> retained only until its content has been folded into the ISRP design set. See
+> [ISRP Orchestration](../isrp/orchestration.md) for the current design.
+
 Status: Current. Regenerated against the running schema and API.
 
 This is the reference: entities, fields, vocabularies, configuration keys and
@@ -353,25 +358,48 @@ The receipt is `{"workflow_instance_id", "action", "revision"}`. A repeated
 command returns the workflow's current state, read fresh. See the technical
 design, section 23, for why.
 
-## WORKFLOW_EVENT
+## EVENT_LOG
+
+One ordered log for the whole application. Flow writes its execution events
+with `aggregate_type = 'WORKFLOW'`; an embedding host writes its own domain
+events under its own aggregate types, into this same table.
 
 ~~~text
 id
 event_id                  globally unique
-workflow_instance_id
+aggregate_type            WORKFLOW, or the host's own
+aggregate_id              text, so integer and ULID keys both fit
 sequence_number
+workflow_instance_id      nullable; set for Flow's rows, foreign key enforced
 step_instance_id
 event_type
 actor
 actor_org_id
+actor_role
+correlation_id
+command_id
 previous_state
 new_state
+previous_revision
+new_revision
+changed_fields_json
+reason_reference
+source_channel
 payload_json
 created_at
 ~~~
 
-Constraint: `UNIQUE(event_id)`, `UNIQUE(workflow_instance_id, sequence_number)`.
-Sequence numbers are dense per workflow, so a consumer can detect a gap.
+Constraint: `UNIQUE(event_id)`,
+`UNIQUE(aggregate_type, aggregate_id, sequence_number)`. Sequence numbers are
+dense per aggregate, so a consumer can detect a gap in any stream, not only a
+workflow's.
+
+`WORKFLOW` is reserved: a host passing it is refused, because a second writer
+allocating sequence numbers in Flow's stream would corrupt its ordering.
+
+Before schema version 5 this table was `workflow_event`, keyed per workflow with
+a mandatory workflow column. The version 5 migration copies its rows in under
+`aggregate_type = 'WORKFLOW'` and drops it.
 
 ## INBOX_EVENT
 
@@ -387,9 +415,17 @@ attempts
 received_at
 processed_at
 last_error
+correlation_id
+next_attempt_at
+claimed_by
+claimed_at
 ~~~
 
 Constraint: `UNIQUE(connector_name, provider_event_id)`
+
+Shared with the host. A provider event may be recorded before it has been
+correlated to any workflow, and one connector runner claims receipts for the
+host and for Flow alike.
 
 ## OUTBOX_EVENT
 
@@ -407,9 +443,19 @@ claimed_at
 last_error
 created_at
 processed_at
+aggregate_type
+aggregate_id
+aggregate_version
+correlation_id
 ~~~
 
 Constraint: `UNIQUE(event_id)`
+
+Shared with the host, so one delivery worker serves both. A host wanting
+emit-once semantics derives `event_id` deterministically from its own
+`(aggregate, version, event_type)`; `UNIQUE(event_id)` then provides it. A
+composite constraint on those columns would not work, because Flow emits
+several events at one revision.
 
 ## WEBHOOK_SUBSCRIPTION
 
@@ -448,8 +494,15 @@ value
 updated_at
 ~~~
 
-Holds `schema_version`. Its presence is what tells initialization that the
-legacy migration has already run and must not run again.
+Holds `schema_version`, currently 5. Its presence is what tells initialization
+that the legacy migration has already run, and its value drives the migration
+chain.
+
+~~~text
+unstamped, populated   the 0.2 migration, then the chain from version 0
+unstamped, empty       already current; nothing to migrate
+stamped below current  each migration in turn, in order
+~~~
 
 # Part V: Vocabularies
 
@@ -504,6 +557,13 @@ composed with all, any, not
 
 Fields are dotted paths. Every operator is total: a type mismatch is false, not
 an error. An unknown operator is rejected at publication.
+
+## Aggregate types
+
+~~~text
+WORKFLOW           reserved for Flow's execution events
+<the host's own>   any other value, e.g. ISRP_ASSESSMENT, ISRP_FINDING
+~~~
 
 ## Permissions
 
@@ -591,6 +651,10 @@ a malformed clock or holiday.
 Twenty-five endpoints. Identity comes from the trusted actor header on every
 command; see `../integration.md`.
 
+An embedding host does not use these. It calls the engine directly, including
+`record_event`, `list_events`, `record_inbox_event` and `claim_inbox_events` for
+the shared reliability surface.
+
 ~~~text
 GET  /api/health
 
@@ -640,7 +704,7 @@ ConflictError    -> 409        ExecutionError -> 500
 
 # Part VIII: Indexes
 
-Thirteen, created after any migration because some reference columns the
+Fifteen, created after any migration because some reference columns the
 migration adds.
 
 ~~~text
@@ -655,9 +719,11 @@ idx_signal_match             signal_receipt(workflow_instance_id, signal_type,
                                             correlation_key, consumed_at)
 idx_automation_claim         automation_job(status, available_at, id)
 idx_timer_due                durable_timer(status, due_at, id)
-idx_event_workflow           workflow_event(workflow_instance_id, sequence_number)
+idx_event_aggregate          event_log(aggregate_type, aggregate_id, sequence_number)
+idx_event_workflow           event_log(workflow_instance_id, id)
 idx_command_workflow         workflow_command(workflow_instance_id)
 idx_outbox_status            outbox_event(status, next_attempt_at, id)
+idx_inbox_claim              inbox_event(status, next_attempt_at, id)
 ~~~
 
 # Part IX: Conformance
@@ -698,6 +764,10 @@ proves it, so a claim here can be checked rather than believed.
 | 29 | Flow's tables can be namespaced alongside a host's | `test_embedding_isolation` |
 | 30 | Version migration is explicit, narrow and refused mid-flight | `test_version_migration` |
 | 31 | Every adapter passes one contract suite | `contract`, `test_sqlite_contract` |
+| 32 | Host and Flow events share one log, sequenced per aggregate | `test_shared_reliability`, `contract` |
+| 33 | A host event and a workflow transition commit together | `test_shared_reliability` |
+| 34 | Host and Flow share one outbox and one inbox | `test_shared_reliability`, `contract` |
+| 35 | A version 4 database carries its event history forward | `test_shared_reliability` |
 
 Criterion 31 is satisfied for SQLite only. Oracle is the intended production
 adapter and does not exist yet; certifying it means subclassing

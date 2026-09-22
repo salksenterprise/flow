@@ -37,31 +37,33 @@ Owns:
 - Assignments, timers, retries, and escalation signals
 - Idempotent commands, execution audit events, and execution outbox events
 
-The boundary is logical even though both modules run in one process and use one
-database. The host owns the connection and transaction. Flow joins that
-transaction and never commits, rolls back, or closes the host connection.
+The boundary is one of module hygiene, not of deployment: both run in one
+process against one database. ISRP owns the connection and the transaction.
+The orchestration joins that transaction and never commits, rolls back, or
+closes it.
 
 ~~~text
 ISRP command
-  -> begin host transaction
+  -> begin transaction
   -> update ISRP domain records
-  -> call embedded Flow engine
-  -> Flow updates execution records and appends its outbox events
-  -> host commits or rolls back both sets of changes together
+  -> call the orchestration
+  -> it updates execution state and appends events and outbox rows
+  -> commit or roll back both sets of changes together
 ~~~
 
-ISRP supplies stable business references such as:
+There are no opaque business references to supply. A run belongs to an ISRP
+request or an ISRP assessment, named by the pair:
 
 ~~~text
-business_type = ISRP_REQUEST
-business_key  = ISR-10042
-correlation_id = ISR-10042
+owner_type = ISRP_REQUEST      owner_type = ISRP_ASSESSMENT
+owner_id   = 10042             owner_id   = 20017
 ~~~
 
-The embedded Flow core does not enforce ISRP requirement or assessment
-semantics. ISRP records may hold foreign keys to Flow workflow and step
-instances because the schemas share one database. Flow continues to treat
-ISRP identifiers and payloads as opaque domain values.
+Those are the rows themselves: orchestration state lives on `isrp_request` and
+`isrp_assessment` beside the business columns, so there is one revision to lock
+against and no pair of records that can disagree. The orchestration modules
+still do not import ISRP's domain models; they take identifiers, statuses and
+configuration.
 
 ### Deployment and database decision
 
@@ -76,6 +78,29 @@ release may claim Oracle support until the Oracle adapter passes the same
 repository contract suite against a real Oracle instance. The ISRP application
 invokes Flow migrations through its own deployment process and schedules Flow's
 timer, job, and outbox routines through host-managed jobs.
+
+### Open dependencies on Flow
+
+Three things this design assumes are not provided by Flow as it stands. Each has
+a workaround; each is recorded so it is not discovered during implementation.
+
+1. **`BLOCKED` is not a Flow execution category.** Flow has `NOT_READY`,
+   `READY`, `ACTIVE`, `WAITING`, `COMPLETED`, `SKIPPED`, `FAILED` and
+   `CANCELLED`. A blocked step FSM state maps to `WAITING`, and ISRP derives
+   `BLOCKED` in its attention projection from its own records. The alternative
+   is to ask for the category in Flow.
+2. **Flow does not enforce execution modes.** Iteration 8 calls for publication
+   validation that rejects AI modes. Flow has no execution-mode field and its
+   validation cannot reject one. ISRP must validate its own templates before
+   calling `import_template`, or the field must be added to Flow.
+3. **`ON_HOLD` cannot return to the previous state automatically.** Flow's FSM
+   transitions are static `from -> to` pairs, so "resume to whatever state you
+   were in" is not expressible. The request and assessment lifecycle FSMs need
+   one explicit resume transition per source state.
+
+ISRP's own step vocabulary is otherwise fully supported: Flow lets each state
+declare its execution category, so the table above maps onto the engine without
+Flow recognising any of the names.
 
 ## Runtime hierarchy
 
@@ -142,19 +167,32 @@ Workflow definitions are versioned. An active assessment continues on its select
 
 ### Step
 
-Every executable DAG node has a step FSM. A human-review step may use:
+Every executable DAG node has a step FSM. The human-review FSM is defined once,
+here, and drawn in the [workflow visual guide](workflow-visual-guide.md); an
+earlier revision of this document listed a different set of states from the
+guide, which would have left the implementer to choose.
 
-~~~text
-NOT_STARTED
-ASSIGNED
-IN_PROGRESS
-WAITING_FOR_REQUESTOR
-RESPONSE_RECEIVED
-SUBMITTED
-COMPLETED
-~~~
+Each state declares the Flow execution category it maps to, which is what lets
+ISRP use its own vocabulary without Flow having to recognise the names.
 
-Exceptional states include BLOCKED, FAILED, SKIPPED, and CANCELLED. Clarification can repeat within the step FSM without rebuilding the assessment DAG.
+| Step state | Flow category | Meaning |
+|---|---|---|
+| `NOT_STARTED` | `NOT_READY` | predecessors not yet satisfied |
+| `AVAILABLE` | `READY` | activatable, nobody has claimed it |
+| `ASSIGNED` | `READY` | claimed or assigned, not started |
+| `IN_PROGRESS` | `ACTIVE` | the responder is working |
+| `SUBMITTED` | `ACTIVE` | handed to review |
+| `IN_REVIEW` | `ACTIVE` | a reviewer or SME is deciding |
+| `WAITING_FOR_RESPONSE` | `WAITING` | clarification requested, waiting on the requestor |
+| `RESPONSE_RECEIVED` | `ACTIVE` | clarification answered, back with the reviewer |
+| `BLOCKED` | `WAITING` | see the open dependency below |
+| `COMPLETED` | `COMPLETED` | terminal |
+| `SKIPPED` | `SKIPPED` | terminal |
+| `FAILED` | `FAILED` | terminal |
+| `CANCELLED` | `CANCELLED` | terminal |
+
+Clarification repeats `IN_REVIEW -> WAITING_FOR_RESPONSE -> RESPONSE_RECEIVED ->
+IN_REVIEW` without rebuilding the assessment DAG.
 
 ## Actor modes and phase boundary
 
@@ -206,12 +244,16 @@ Suggested request roll-up rules, evaluated in priority order:
 4. At least one required assessment is active produces ASSESSMENTS_IN_PROGRESS.
 5. CLOSED requires an explicit request closure action after closure policy passes.
 
-Suggested attention rules:
+Attention rules, in priority order. [RDBMS status projections](status-projections.md)
+is canonical for these; this list mirrors it rather than restating a shorter
+version, which an earlier revision of this document did.
 
 1. Any required child blocked produces BLOCKED.
-2. Any child waiting for the requestor produces ACTION_REQUIRED.
-3. Any child waiting for a reviewer produces REVIEW_REQUIRED.
-4. Otherwise attention is NONE.
+2. Any child requiring remediation produces REMEDIATION_REQUIRED.
+3. Any child waiting for the requestor produces ACTION_REQUIRED.
+4. Any child waiting for a reviewer produces REVIEW_REQUIRED.
+5. Any child with stale or expired evidence produces EVIDENCE_REFRESH_REQUIRED.
+6. Otherwise attention is NONE.
 
 Child records remain authoritative. Parent projections can be rebuilt from children and events. A clarification loop changes attention and step status but normally leaves the assessment lifecycle IN_PROGRESS.
 
@@ -309,7 +351,8 @@ Outbound registration is asynchronous:
 ~~~text
 ISRP transaction
   -> save finding/remediation decision
-  -> OUTBOX_EVENT: NONCOMPLIANCE_REGISTRATION_REQUESTED
+  -> engine.record_event(..., "NONCOMPLIANCE_REGISTRATION_REQUESTED")
+       writes the shared log row and its outbox row together
   -> commit
   -> connector creates or locates external issue idempotently
 ~~~
@@ -318,7 +361,7 @@ Inbound updates are also idempotent:
 
 ~~~text
 Issue-management event or reconciliation poll
-  -> INTEGRATION_INBOX_EVENT
+  -> engine.record_inbox_event(...)   the shared inbox, deduplicated
   -> correlate connector + provider event ID
   -> update ISSUE_REFERENCE observed state
   -> create ISRP validation work when externally resolved
@@ -346,8 +389,7 @@ Lifecycle status is authoritative and changes only through an authorized FSM tra
 ~~~text
 Child business change
   -> authoritative history and current pointer
-  -> audit event
-  -> OUTBOX_EVENT
+  -> record_event writes the shared log row and its outbox row
   -> commit
   -> status projector
        -> ASSESSMENT_STATUS_PROJECTION
@@ -379,10 +421,12 @@ Requirement responses use different semantics:
 
 - Commands carry client-generated idempotency keys.
 - Transitions validate the current revision before committing.
-- ISRP business updates, Flow execution updates, audit records, and outbox records commit in the same host-owned database transaction.
+- ISRP business updates, Flow execution updates, shared log entries, and shared
+  outbox records commit in the same host-owned database transaction.
 - Consumers handle events idempotently.
 - External issue creation and updates never run inside the primary business transaction.
-- Outbound effects use OUTBOX_EVENT; inbound provider events use INTEGRATION_INBOX_EVENT.
+- Outbound effects and inbound provider events use the outbox and inbox shared
+  with Flow, written through the engine. ISRP keeps no parallel set.
 - Connector calls and inbound event handling are idempotent and reconcilable.
 - External issue resolution creates validation work and never closes a finding by itself.
 - Long-running work uses durable timers and retry policies.

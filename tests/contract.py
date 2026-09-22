@@ -4,6 +4,10 @@ SQLite is the development adapter and Oracle is the production one. They must
 behave identically, and the only way to know that is to hold them to one suite
 rather than two.
 
+This covers the shared reliability surface too: an adapter must let an
+embedding host write its own domain events, outbox rows and provider receipts
+into the same tables Flow uses.
+
 To certify a new adapter, subclass RepositoryContract with a TestCase, return
 your adapter from make_repository(), and run it. Nothing in here is specific to
 SQLite: the tests go through the repository interface and the engine, never
@@ -20,7 +24,9 @@ import threading
 import uuid
 from typing import Any
 
-from workflow_core import WorkflowEngine
+from isrp.orchestration import WorkflowEngine
+
+from support import aggregate_args, owner
 
 
 def command(**values):
@@ -81,9 +87,9 @@ class RepositoryContract:
 
     def start(self, template):
         version = self.version_for(template)
-        return self.engine.start_workflow(command(
-            workflow_version_id=version, title="Contract", business_type="CONTRACT",
-            business_key=str(uuid.uuid4()), variables={}, subjects=[]))
+        return self.engine.start_request(command(
+            workflow_version_id=version, title="Contract",
+            variables={}))
 
     def scalar(self, sql, *args):
         with self.repository.transaction():
@@ -95,27 +101,27 @@ class RepositoryContract:
         workflow = self.start(HUMAN)
         self.repository.initialize()
         self.assertEqual(
-            self.engine.get_workflow(workflow["id"])["execution_status"], "RUNNING")
+            self.engine.get_aggregate(owner(workflow))["execution_status"], "RUNNING")
 
     # Transactions
 
     def test_contract_a_failed_transaction_discards_its_writes(self):
         workflow = self.start(HUMAN)
         before = self.scalar(
-            "SELECT COUNT(*) FROM workflow_event WHERE workflow_instance_id=?",
-            workflow["id"])
+            "SELECT COUNT(*) FROM event_log WHERE aggregate_type=? AND aggregate_id=?",
+            *aggregate_args(workflow))
 
         class Boom(Exception):
             pass
 
         with self.assertRaises(Boom):
             with self.repository.transaction():
-                self.repository.append_event(workflow["id"], "CONTRACT_PROBE", "contract")
+                self.repository.append_event(owner(workflow), "CONTRACT_PROBE", "contract")
                 raise Boom()
 
         self.assertEqual(
-            self.scalar("SELECT COUNT(*) FROM workflow_event WHERE workflow_instance_id=?",
-                        workflow["id"]),
+            self.scalar("SELECT COUNT(*) FROM event_log WHERE aggregate_type=? AND aggregate_id=?",
+                        *aggregate_args(workflow)),
             before)
 
     # Idempotency
@@ -124,31 +130,32 @@ class RepositoryContract:
         workflow = self.start(HUMAN)
         identifier = str(uuid.uuid4())
         with self.repository.transaction():
-            self.repository.record_command(identifier, workflow["id"], "probe", 7)
+            self.repository.record_command(identifier, owner(workflow), "probe", 7)
             receipt = self.repository.command_result(identifier)
-        self.assertEqual(receipt["workflow_instance_id"], workflow["id"])
+        self.assertEqual(
+            (receipt["owner_type"], receipt["owner_id"]), owner(workflow))
         self.assertEqual(receipt["revision"], 7)
         with self.repository.transaction():
             self.assertIsNone(self.repository.command_result(str(uuid.uuid4())))
 
     # Ordered events and the transactional outbox
 
-    def test_contract_event_sequence_is_dense_and_ordered_per_workflow(self):
+    def test_contract_event_sequence_is_dense_and_ordered_per_aggregate(self):
         workflow = self.start(HUMAN)
         self.engine.apply_action(workflow["steps"][0]["id"], command(
             action="start", expected_revision=workflow["revision"], payload={}))
         with self.repository.transaction():
             sequences = [row[0] for row in self.repository.db.execute(
-                """SELECT sequence_number FROM workflow_event
-                   WHERE workflow_instance_id=? ORDER BY sequence_number""",
-                (workflow["id"],))]
+                """SELECT sequence_number FROM event_log
+                   WHERE aggregate_type=? AND aggregate_id=? ORDER BY sequence_number""",
+                aggregate_args(workflow))]
         self.assertEqual(sequences, list(range(1, len(sequences) + 1)))
 
     def test_contract_every_event_writes_an_outbox_row(self):
         workflow = self.start(HUMAN)
         events = self.scalar(
-            "SELECT COUNT(*) FROM workflow_event WHERE workflow_instance_id=?",
-            workflow["id"])
+            "SELECT COUNT(*) FROM event_log WHERE aggregate_type=? AND aggregate_id=?",
+            *aggregate_args(workflow))
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM outbox_event"), events)
 
     # Worker claiming
@@ -182,7 +189,7 @@ class RepositoryContract:
 
     def test_contract_suspended_work_is_not_handed_out(self):
         workflow = self.start(AUTOMATED)
-        self.engine.apply_workflow_action(workflow["id"], command(
+        self.engine.apply_lifecycle_action(owner(workflow), command(
             action="suspend", expected_revision=workflow["revision"]))
         self.assertEqual(self.engine.claim_automation_jobs("worker-1"), [])
         self.assertEqual(self.engine.process_due_timers(), 0)
@@ -192,29 +199,29 @@ class RepositoryContract:
     def test_contract_a_signal_is_consumed_exactly_once(self):
         workflow = self.start(WAITING)
         signal = command(signal_type="READY", payload={})
-        first = self.engine.receive_signal(workflow["id"], signal)
-        second = self.engine.receive_signal(workflow["id"], signal)
+        first = self.engine.receive_signal(owner(workflow), signal)
+        second = self.engine.receive_signal(owner(workflow), signal)
         self.assertEqual(first["revision"], second["revision"])
         self.assertEqual(
-            self.scalar("SELECT COUNT(*) FROM signal_receipt WHERE workflow_instance_id=?",
-                        workflow["id"]),
+            self.scalar("""SELECT COUNT(*) FROM signal_receipt
+                           WHERE owner_type=? AND owner_id=?""", *owner(workflow)),
             1)
 
     # Facts
 
     def test_contract_fact_history_records_the_previous_and_new_value(self):
         workflow = self.start(HUMAN)
-        self.engine.update_facts(workflow["id"], command(
+        self.engine.update_facts(owner(workflow), command(
             facts={"tier": "GOLD"}, expected_revision=workflow["revision"],
             source_type="CONTRACT", source_reference="REF-1"))
-        updated = self.engine.get_workflow(workflow["id"])
-        self.engine.update_facts(workflow["id"], command(
+        updated = self.engine.get_aggregate(owner(workflow))
+        self.engine.update_facts(owner(workflow), command(
             facts={"tier": "PLATINUM"}, expected_revision=updated["revision"]))
         with self.repository.transaction():
             rows = [dict(row) for row in self.repository.db.execute(
                 """SELECT previous_value_json,new_value_json FROM workflow_fact_history
-                   WHERE workflow_instance_id=? AND fact_key='tier' ORDER BY id""",
-                (workflow["id"],))]
+                   WHERE owner_type=? AND owner_id=? AND fact_key='tier' ORDER BY id""",
+                owner(workflow))]
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["previous_value_json"], "null")
         self.assertEqual(rows[1]["previous_value_json"], '"GOLD"')
@@ -243,10 +250,46 @@ class RepositoryContract:
     def test_contract_operational_counters_are_reported(self):
         self.start(HUMAN)
         counters = self.repository.operational_counters()
-        for key in ("workflows_running", "jobs_queued", "outbox_pending",
-                    "outbox_dead_letter", "timers_due", "workflows_stuck"):
+        for key in ("aggregates_running", "jobs_queued", "outbox_pending",
+                    "outbox_dead_letter", "timers_due", "aggregates_stuck"):
             self.assertIn(key, counters)
-        self.assertEqual(counters["workflows_running"], 1)
+        self.assertEqual(counters["aggregates_running"], 1)
+
+    # The shared reliability surface
+
+    def test_contract_domain_and_execution_events_share_one_sequence(self):
+        """The single clearest argument for fusing, asserted.
+
+        A determination recorded by the domain and the step transition it
+        caused sit in one stream, in order, on one aggregate. Two logs could
+        not have said which came first.
+        """
+        workflow = self.start(HUMAN)
+        before = self.engine.list_events(*aggregate_args(workflow))
+        self.assertGreater(len(before), 0, "execution events land on the aggregate")
+
+        self.engine.record_event(*aggregate_args(workflow), "REQUEST_DETERMINED")
+        self.engine.apply_action(workflow["steps"][0]["id"], command(
+            action="start", expected_revision=workflow["revision"], payload={}))
+
+        events = self.engine.list_events(*aggregate_args(workflow))
+        self.assertEqual([item["sequence_number"] for item in events],
+                         list(range(1, len(events) + 1)))
+        types = [item["event_type"] for item in events]
+        self.assertLess(types.index("REQUEST_DETERMINED"), types.index("STEP_START"))
+
+    def test_contract_a_domain_event_is_paired_with_an_outbox_row(self):
+        self.start(HUMAN)
+        before = self.scalar("SELECT COUNT(*) FROM outbox_event")
+        self.engine.record_event("ISRP_FINDING", "F-2", "FINDING_RAISED")
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM outbox_event"), before + 1)
+
+    def test_contract_the_inbox_deduplicates_without_an_aggregate(self):
+        event = {"connector_name": "contract-connector", "provider_event_id": "p-1",
+                 "event_type": "SOMETHING_HAPPENED"}
+        self.assertFalse(self.engine.record_inbox_event(event)["duplicate"])
+        self.assertTrue(self.engine.record_inbox_event(event)["duplicate"])
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM inbox_event"), 1)
 
     # Delivery
 

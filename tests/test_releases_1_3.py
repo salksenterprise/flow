@@ -5,8 +5,10 @@ import unittest
 import uuid
 from pathlib import Path
 
-from workflow_core import ConflictError, WorkflowEngine
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import ConflictError, WorkflowEngine
+from isrp.orchestration import SQLiteWorkflowRepository
+
+from support import owner
 
 
 def command(**values):
@@ -41,11 +43,10 @@ class ReleaseOneToThreeTests(unittest.TestCase):
     def start(self, version_id, **values):
         data = {
             "workflow_version_id": version_id, "title": "Test workflow",
-            "business_type": "TEST", "business_key": str(uuid.uuid4()),
-            "variables": {}, "subjects": [],
+            "variables": {},
         }
         data.update(values)
-        return self.engine.start_workflow(command(**data))
+        return self.engine.start_request(command(**data))
 
     def act(self, workflow, key, action, **values):
         step = next(item for item in workflow["steps"] if item["step_key"] == key)
@@ -77,39 +78,40 @@ class ReleaseOneToThreeTests(unittest.TestCase):
         template["lifecycle_fsm"] = lifecycle
         template["steps"][0]["fsm"] = step_fsm
         workflow = self.start(self.import_template(template))
-        self.assertEqual(workflow["lifecycle_state"], "DRAFT")
-        workflow = self.engine.apply_workflow_action(
-            workflow["id"], command(action="submit", expected_revision=workflow["revision"])
+        self.assertEqual(workflow["lifecycle_status"], "DRAFT")
+        workflow = self.engine.apply_lifecycle_action(owner(workflow), command(action="submit", expected_revision=workflow["revision"])
         )
         workflow = self.act(workflow, "work", "claim")
         workflow = self.act(workflow, "work", "finish")
-        self.assertEqual(workflow["lifecycle_state"], "CLOSED")
+        self.assertEqual(workflow["lifecycle_status"], "CLOSED")
         self.assertEqual(workflow["execution_status"], "COMPLETED")
 
-    def test_parent_child_workflow_join(self):
-        child_version = self.import_template(linear_template("child-assessment"))
-        parent = {
+    def test_a_request_waits_for_its_assessment(self):
+        assessment_version = self.import_template(linear_template("external-assessment"))
+        definition = {
             "key": "request-orchestration", "name": "Request", "version": 1, "publish": True,
             "steps": [
-                {"key": "assessments", "name": "Assessments", "type": "SUBWORKFLOW"},
+                {"key": "assessments", "name": "Assessments", "type": "ASSESSMENT",
+                 "configuration": {
+                     "assessment_workflow_version_id": assessment_version,
+                     "assessment_type": "EXTERNAL",
+                     "title": "External assessment"}},
                 {"key": "end", "name": "End", "type": "END"},
             ],
             "transitions": [{"from_step": "assessments", "to_step": "end"}],
         }
-        request = self.start(self.import_template(parent), business_key="REQ-1")
+        request = self.start(self.import_template(definition), title="REQ-1")
         sub = next(item for item in request["steps"] if item["step_key"] == "assessments")
         self.assertEqual(sub["execution_status"], "WAITING")
-        child = self.engine.start_child_workflow(request["id"], command(
-            workflow_version_id=child_version, title="External assessment",
-            business_type="ASSESSMENT", business_key="ASMT-1", variables={}, subjects=[],
-            parent_step_instance_id=sub["id"], relationship_type="ASSESSMENT",
-            relationship_key="EXTERNAL", required=True, expected_revision=request["revision"],
-        ))
-        child = self.act(child, "work", "start")
-        child = self.act(child, "work", "complete")
-        request = self.engine.get_workflow(request["id"])
+        self.assertEqual(len(request["assessments"]), 1)
+        self.assertEqual(request["assessments"][0]["assessment_type"], "EXTERNAL")
+
+        assessment = self.engine.get_assessment(request["assessments"][0]["id"])
+        assessment = self.act(assessment, "work", "start")
+        self.act(assessment, "work", "complete")
+
+        request = self.engine.get_aggregate(owner(request))
         self.assertEqual(request["execution_status"], "COMPLETED")
-        self.assertEqual(len(request["children"]), 1)
 
     def test_wait_signal_and_early_signal(self):
         template = linear_template(
@@ -118,7 +120,7 @@ class ReleaseOneToThreeTests(unittest.TestCase):
         )
         workflow = self.start(self.import_template(template))
         self.assertEqual(workflow["steps"][0]["execution_status"], "WAITING")
-        workflow = self.engine.receive_signal(workflow["id"], command(
+        workflow = self.engine.receive_signal(owner(workflow), command(
             signal_type="EXTERNAL_VALIDATION_COMPLETED", correlation_key="FINDING-1",
             payload={"result_reference": "isrp://validation/1"},
         ))
@@ -146,7 +148,7 @@ class ReleaseOneToThreeTests(unittest.TestCase):
             ],
         }
         workflow = self.start(self.import_template(template))
-        workflow = self.engine.update_facts(workflow["id"], command(
+        workflow = self.engine.update_facts(owner(workflow), command(
             facts={"sme_required": True}, expected_revision=workflow["revision"],
             source_type="ISRP", source_reference="REQ-1",
         ))
@@ -213,16 +215,14 @@ class ReleaseOneToThreeTests(unittest.TestCase):
     def test_timer_and_lifecycle_operations(self):
         version = self.import_template(linear_template("timer", "TIMER", {"delay_seconds": 0}))
         workflow = self.start(version)
-        workflow = self.engine.apply_workflow_action(
-            workflow["id"], command(action="suspend", expected_revision=workflow["revision"])
+        workflow = self.engine.apply_lifecycle_action(owner(workflow), command(action="suspend", expected_revision=workflow["revision"])
         )
         self.assertEqual(workflow["execution_status"], "SUSPENDED")
-        workflow = self.engine.apply_workflow_action(
-            workflow["id"], command(action="resume", expected_revision=workflow["revision"])
+        workflow = self.engine.apply_lifecycle_action(owner(workflow), command(action="resume", expected_revision=workflow["revision"])
         )
         self.assertEqual(workflow["execution_status"], "RUNNING")
         self.assertEqual(self.engine.process_due_timers(), 1)
-        self.assertEqual(self.engine.get_workflow(workflow["id"])["execution_status"], "COMPLETED")
+        self.assertEqual(self.engine.get_aggregate(owner(workflow))["execution_status"], "COMPLETED")
 
     def test_duplicate_signal_is_idempotent(self):
         version = self.import_template(linear_template(
@@ -230,8 +230,8 @@ class ReleaseOneToThreeTests(unittest.TestCase):
         ))
         workflow = self.start(version)
         signal = command(signal_type="READY", payload={})
-        first = self.engine.receive_signal(workflow["id"], signal)
-        second = self.engine.receive_signal(workflow["id"], signal)
+        first = self.engine.receive_signal(owner(workflow), signal)
+        second = self.engine.receive_signal(owner(workflow), signal)
         self.assertEqual(first["revision"], second["revision"])
 
     def test_external_inbox_event_is_deduplicated(self):
@@ -245,8 +245,8 @@ class ReleaseOneToThreeTests(unittest.TestCase):
             "event_type": "ISSUE_RESOLVED",
             "payload": {"external_issue_id": "ISS-9"},
         }
-        first = self.engine.ingest_external_event(workflow["id"], event)
-        second = self.engine.ingest_external_event(workflow["id"], event)
+        first = self.engine.ingest_external_event(owner(workflow), event)
+        second = self.engine.ingest_external_event(owner(workflow), event)
         self.assertEqual(first["revision"], second["revision"])
         with self.repository.transaction():
             count = self.repository.db.execute("SELECT COUNT(*) FROM inbox_event").fetchone()[0]
@@ -254,8 +254,7 @@ class ReleaseOneToThreeTests(unittest.TestCase):
 
     def test_suspend_rejects_step_actions(self):
         workflow = self.start(self.import_template(linear_template("suspend")))
-        workflow = self.engine.apply_workflow_action(
-            workflow["id"], command(action="suspend", expected_revision=workflow["revision"])
+        workflow = self.engine.apply_lifecycle_action(owner(workflow), command(action="suspend", expected_revision=workflow["revision"])
         )
         with self.assertRaises(ConflictError):
             self.act(workflow, "work", "start")

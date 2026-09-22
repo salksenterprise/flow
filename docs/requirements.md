@@ -1,7 +1,13 @@
-# Flow Requirements
+# Orchestration Requirements
 
-Status: Draft for review. Target is the embedded core described in the
-[charter](charter.md).
+> **Identifiers only.** The rows below keep their identifiers, because the
+> tests cite them and the [definition of done](definition-of-done.md) is
+> written in terms of them. The design they were written against is superseded
+> by [ISRP Orchestration](isrp/orchestration.md): there is no separate workflow
+> engine, service or package, and no workflow instance. Where a row still says
+> workflow, read the request or assessment the run belongs to.
+
+Status: Draft for review.
 
 ## How to read this document
 
@@ -31,7 +37,8 @@ work. Every `Defect` row below was reproduced against the current code.
 ## A. Embedding contract
 
 The differentiating requirements. `examples/embedded-host` is the reference
-integration and `tests/test_embedding.py` holds the contract.
+integration; `tests/test_embedding.py` and `tests/test_shared_reliability.py`
+hold the contract.
 
 | ID | Requirement | Status |
 |---|---|---|
@@ -39,7 +46,7 @@ integration and `tests/test_embedding.py` holds the contract.
 | EMB-2 | The host opens and commits the transaction; Flow calls no commit or rollback | Done |
 | EMB-3 | A domain write and a workflow transition in one host transaction commit atomically | Done |
 | EMB-4 | Flow raises typed errors the host can catch and roll back on; no bare exceptions escape | Done |
-| EMB-5 | Flow's tables carry a configurable name prefix to avoid collision with host tables | Done |
+| EMB-5 | The tables carry a configurable name prefix, which is what keeps two runs apart in one database | Done |
 | EMB-6 | Flow owns its own migration chain, runnable from the host's migration tool | Done |
 | EMB-7 | Schema creation is explicit and idempotent; importing Flow never mutates a database | Done |
 | EMB-8 | Actor identity is a typed value passed in-process; Flow never parses credentials | Done |
@@ -48,6 +55,11 @@ integration and `tests/test_embedding.py` holds the contract.
 | EMB-11 | The core imports only the standard library and its own ports | Done |
 | EMB-12 | Embedded and service modes run the same core through the same repository ports | Done |
 | EMB-13 | A host may hold a real foreign key from its own tables into Flow's | Done |
+| EMB-14 | The host writes its own domain events into Flow's event log, ordered per aggregate | Done |
+| EMB-15 | A host domain event and a workflow transition commit in one transaction | Done |
+| EMB-16 | The host shares Flow's outbox, so there is one delivery mechanism | Done |
+| EMB-17 | The host shares Flow's inbox, deduplicated per connector without needing a workflow | Done |
+| EMB-18 | The WORKFLOW aggregate type is reserved, so a host cannot corrupt Flow's sequence | Done |
 
 ## B. Definitions
 
@@ -62,6 +74,7 @@ integration and `tests/test_embedding.py` holds the contract.
 | DEF-7 | Publication validates embedded lifecycle and step FSMs for duplicate and dangling transitions | Untested |
 | DEF-8 | Publication rejects unknown guard operators rather than silently evaluating them false | Done |
 | DEF-9 | A defined migration policy moves an instance between definition versions | Done |
+| DEF-10 | A step records who performs it, and publication rejects AI execution modes | Done |
 
 ## C. Execution
 
@@ -80,8 +93,8 @@ integration and `tests/test_embedding.py` holds the contract.
 | EXE-11 | Terminating a workflow cancels its open nodes, timers, jobs and required children | Done |
 | EXE-12 | A suspended workflow performs no node activation, timer firing, or job completion | Done |
 | EXE-13 | Each FSM state declares its execution category rather than having one inferred from its name | Done |
-| EXE-14 | A parent SUBWORKFLOW node completes when its required children satisfy the configured policy | Done |
-| EXE-15 | A child failure policy other than fail-the-parent is honored | Done |
+| EXE-14 | An ASSESSMENT node completes when its required assessments satisfy the configured policy | Done |
+| EXE-15 | An assessment failure policy other than fail-the-request is honored | Done |
 | EXE-16 | An authorized actor may override a join with a mandatory recorded reason | Done |
 
 ## D. Work and assignment
@@ -93,7 +106,7 @@ integration and `tests/test_embedding.py` holds the contract.
 | WRK-3 | Candidate organization is enforced against the actor's organization | Done |
 | WRK-4 | Reassignment preserves prior assignments as history rather than overwriting them | Untested |
 | WRK-5 | A node supports repeated attempts with clarification and response cycles | Untested |
-| WRK-6 | Work is queryable by assignee, candidate, state and business key | Done |
+| WRK-6 | Work is queryable by assignee, candidate, state and owning aggregate | Done |
 | WRK-7 | Work queries are paginated and indexed | Done |
 | WRK-8 | A node may carry a due time, and breach raises a configured action | Done |
 
@@ -166,25 +179,24 @@ integration and `tests/test_embedding.py` holds the contract.
 
 
 
+
+
 ## Status summary
 
 ~~~text
-Done        73
+Done        79
 Untested    13
 Partial      0
 Defect       0
 Planned      0
 Blocked      1
-total       87
+total       93
 ~~~
 
-73 of 87 requirements are backed by a test: 24 at the first audit, 34 after
-the P0 fixes, 42 after the embedding spike, 73 now. The suite is 131 tests,
-up from 22.
-
-The 13 rows still marked Untested are implemented but uncited: FSM guard and
-reason enforcement, retry backoff, timer restart survival, assignment history
-and the driver's iteration bound. They are the next thing worth closing.
+The suite is 137 tests. Thirteen fell away with the HTTP shell: nine that
+exercised it directly, and four that checked it refusing a permission from a
+request body. Fused there is no such interface, so that requirement now holds
+by construction rather than by a guard.
 
 ## Verified defects
 

@@ -20,7 +20,12 @@ Future:
   AI_AUTOMATED_SUPERVISED
 ~~~
 
-The generic Flow engine may retain extensible execution-mode values, but current ISRP workflow publication rejects AI modes. AI is introduced only through separately published future workflow versions.
+Flow has no execution-mode concept: it knows node types, not who or what
+performs the work. Execution mode is an ISRP field, and ISRP validates its own
+templates before importing them, because Flow's publication validation cannot
+reject a mode it does not model. AI is introduced only through separately
+published future workflow versions. See the open dependencies in
+[Architecture](architecture.md).
 
 ## Capability summary
 

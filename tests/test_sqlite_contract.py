@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import SQLiteWorkflowRepository
 
 from contract import RepositoryContract
 

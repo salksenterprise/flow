@@ -8,9 +8,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from workflow_core import ValidationError, WorkflowEngine
-from workflow_core.calendars import deadline
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import ValidationError, WorkflowEngine
+from isrp.orchestration.calendars import deadline
+from isrp.orchestration import SQLiteWorkflowRepository
+
+from support import aggregate_args, owner
 
 
 OFFICE = {"business_days": [0, 1, 2, 3, 4], "opens_at": "09:00", "closes_at": "17:00"}
@@ -73,9 +75,9 @@ class ServiceLevelTests(unittest.TestCase):
 
     def start(self, template):
         version = self.engine.import_template(template)["workflow_version_id"]
-        return self.engine.start_workflow(command(
-            workflow_version_id=version, title="T", business_type="TEST",
-            business_key=str(uuid.uuid4()), variables={}, subjects=[]))
+        return self.engine.start_request(command(
+            workflow_version_id=version, title="T",
+            variables={}))
 
     def expire_service_levels(self):
         with self.repository.transaction():
@@ -83,26 +85,26 @@ class ServiceLevelTests(unittest.TestCase):
                 """UPDATE durable_timer SET due_at='2000-01-01T00:00:00.000Z'
                    WHERE action='SLA_BREACH'""")
 
-    def events(self, workflow_id):
+    def events(self, workflow):
         with self.repository.transaction():
             return [row[0] for row in self.repository.db.execute(
-                "SELECT event_type FROM workflow_event WHERE workflow_instance_id=?",
-                (workflow_id,))]
+                "SELECT event_type FROM event_log WHERE aggregate_type=? AND aggregate_id=?",
+                aggregate_args(workflow))]
 
     # WRK-8: a node carries a due time, and breach raises a configured action.
 
     def test_wrk8_due_time_is_recorded_on_the_node_and_its_assignment(self):
         workflow = self.start(self.template(
             "sla-due", {"due_in_seconds": 3600, "candidates": []}))
-        self.assertIn("STEP_DUE_AT_SET", self.events(workflow["id"]))
+        self.assertIn("STEP_DUE_AT_SET", self.events(workflow))
 
     def test_wrk8_breach_is_recorded_without_changing_the_node_by_default(self):
         workflow = self.start(self.template("sla-notify", {"due_in_seconds": 3600}))
         self.expire_service_levels()
         self.assertEqual(self.engine.process_due_timers(), 1)
 
-        after = self.engine.get_workflow(workflow["id"])
-        self.assertIn("STEP_SLA_BREACHED", self.events(workflow["id"]))
+        after = self.engine.get_aggregate(owner(workflow))
+        self.assertIn("STEP_SLA_BREACHED", self.events(workflow))
         self.assertEqual(after["steps"][0]["execution_status"], "READY")
         self.assertEqual(after["execution_status"], "RUNNING")
 
@@ -113,7 +115,7 @@ class ServiceLevelTests(unittest.TestCase):
         self.expire_service_levels()
         self.engine.process_due_timers()
 
-        assignments = self.engine.get_workflow(workflow["id"])["steps"][0]["assignments"]
+        assignments = self.engine.get_aggregate(owner(workflow))["steps"][0]["assignments"]
         self.assertEqual(
             next(item["assignee"] for item in assignments if item["status"] == "OPEN"),
             "HEAD_OF_REVIEW")
@@ -124,7 +126,7 @@ class ServiceLevelTests(unittest.TestCase):
         self.expire_service_levels()
         self.engine.process_due_timers()
 
-        after = self.engine.get_workflow(workflow["id"])
+        after = self.engine.get_aggregate(owner(workflow))
         self.assertEqual(after["steps"][0]["execution_status"], "FAILED")
         self.assertEqual(after["execution_status"], "FAILED")
 
@@ -140,9 +142,9 @@ class ServiceLevelTests(unittest.TestCase):
         self.expire_service_levels()
         self.engine.process_due_timers()
 
-        after = self.engine.get_workflow(workflow["id"])
+        after = self.engine.get_aggregate(owner(workflow))
         self.assertEqual(after["execution_status"], "COMPLETED")
-        self.assertNotIn("STEP_SLA_BREACHED", self.events(workflow["id"]))
+        self.assertNotIn("STEP_SLA_BREACHED", self.events(workflow))
 
     def test_wrk8_invalid_service_level_configuration_is_rejected(self):
         for configuration in (
@@ -182,7 +184,7 @@ class ServiceLevelTests(unittest.TestCase):
         ]
         self.engine.import_template(second)
 
-        running = self.engine.get_workflow(workflow["id"])
+        running = self.engine.get_aggregate(owner(workflow))
         self.assertEqual({item["step_key"] for item in running["steps"]},
                          {"review", "end"})
 

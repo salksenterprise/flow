@@ -7,8 +7,10 @@ import unittest
 import uuid
 from pathlib import Path
 
-from workflow_core import ConflictError, ValidationError, WorkflowEngine
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import ConflictError, ValidationError, WorkflowEngine
+from isrp.orchestration import SQLiteWorkflowRepository
+
+from support import owner
 
 
 def command(**values):
@@ -54,15 +56,15 @@ class VersionMigrationTests(unittest.TestCase):
         self.temp.cleanup()
 
     def start(self, version_id):
-        return self.engine.start_workflow(command(
-            workflow_version_id=version_id, title="T", business_type="TEST",
-            business_key=str(uuid.uuid4()), variables={}, subjects=[]))
+        return self.engine.start_request(command(
+            workflow_version_id=version_id, title="T",
+            variables={}))
 
     def migrate(self, workflow, target, **overrides):
         body = dict(target_version_id=target, reason="Policy change approved",
                     expected_revision=workflow["revision"], actor=MIGRATOR)
         body.update(overrides)
-        return self.engine.migrate_workflow_version(workflow["id"], command(**body))
+        return self.engine.migrate_version(owner(workflow), command(**body))
 
     def keys(self, workflow):
         return {item["step_key"]: item["execution_status"] for item in workflow["steps"]}
@@ -131,7 +133,7 @@ class VersionMigrationTests(unittest.TestCase):
             [{"from_step": "intake", "to_step": "end"}], lifecycle))["workflow_version_id"]
         with self.assertRaises(ConflictError) as raised:
             self.migrate(self.start(self.v1), strict)
-        self.assertIn("lifecycle state", str(raised.exception))
+        self.assertIn("lifecycle status", str(raised.exception))
 
     def test_def9_refuses_a_completed_workflow_and_a_no_op(self):
         workflow = self.start(self.v1)
@@ -151,8 +153,8 @@ class VersionMigrationTests(unittest.TestCase):
         workflow = self.start(self.v1)
         once = command(target_version_id=self.v2, reason="Approved",
                        expected_revision=workflow["revision"], actor=MIGRATOR)
-        first = self.engine.migrate_workflow_version(workflow["id"], once)
-        second = self.engine.migrate_workflow_version(workflow["id"], once)
+        first = self.engine.migrate_version(owner(workflow), once)
+        second = self.engine.migrate_version(owner(workflow), once)
         self.assertEqual(first["revision"], second["revision"])
         self.assertEqual(second["version_number"], 2)
 

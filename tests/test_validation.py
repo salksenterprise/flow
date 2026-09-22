@@ -1,7 +1,7 @@
 import unittest
 
-from workflow_core.errors import ValidationError
-from workflow_core.validation import validate_template
+from isrp.orchestration.errors import ValidationError
+from isrp.orchestration.validation import validate_template
 
 
 class TemplateValidationTests(unittest.TestCase):

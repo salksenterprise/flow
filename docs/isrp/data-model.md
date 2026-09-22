@@ -127,8 +127,8 @@ ISRP_REQUEST
   |      |
   |      +--< ASSESSMENT_REQUIREMENT
   |      |      |
-  |      |      +-- one active RESPONSE_DRAFT
-  |      |      +--< RESPONSE_SUBMISSION
+  |      |      +-- one active REQUIREMENT_RESPONSE_DRAFT
+  |      |      +--< REQUIREMENT_RESPONSE_SUBMISSION
   |      |      |      +--< RESPONDER_ASSERTION
   |      |      |      +--< REVIEWER_DETERMINATION
   |      |      |
@@ -161,9 +161,9 @@ REQUIREMENT_SET  |
   +--< REQUIREMENT_SET_VERSION
          +--< REQUIREMENT_SET_MEMBER
 
-Flow references:
-ISRP_REQUEST.workflow_instance_id
-ISRP_ASSESSMENT.workflow_instance_id
+Orchestration references:
+ISRP_REQUEST and ISRP_ASSESSMENT carry their own orchestration columns
+step_instance.(owner_type, owner_id) names one of them
 REQUIREMENT_WORK_PACKAGE.step_instance_id
 ~~~
 
@@ -268,7 +268,10 @@ trigger_type
 requestor_id
 requestor_org_id
 lifecycle_status
-workflow_instance_id
+execution_status
+current_stage
+workflow_version_id
+variables_json
 metadata_json
 scope_fingerprint
 revision
@@ -359,7 +362,6 @@ transition_name
 reason
 changed_by
 changed_at
-workflow_instance_id
 step_instance_id
 request_revision
 correlation_id
@@ -426,8 +428,12 @@ description
 owning_org_id
 assessment_lead_id
 lifecycle_status
-workflow_instance_id
-workflow_definition_version
+execution_status
+current_stage
+workflow_version_id
+variables_json
+parent_step_instance_id
+required_flag
 metadata_json
 revision
 started_at
@@ -528,71 +534,92 @@ transition_name
 reason
 changed_by
 changed_at
-workflow_instance_id
 step_instance_id
 assessment_revision
 correlation_id
 ~~~
 
-# Part IV: Generic Flow model and ISRP bindings
+# Part IV: The orchestration tables
 
-The embedded Flow package maintains its canonical tables under an ISRP-owned
-database schema or configured table prefix. The ISRP deployment invokes Flow's
-migration entry point from the host migration process. The following list
-records the logical integration boundary.
+These are ISRP's own tables, created and migrated by the ISRP migration
+process. The names are taken from `isrp/orchestration/schema.py` rather than
+paraphrased.
 
-## Flow definition entities
+A configurable table prefix exists, and rewrites the object names in every
+statement on the way to the database. Nothing in ISRP needs it; the tests use
+it to keep two runs apart in one file. A separate database schema is not an
+option, because on SQLite a schema-qualified name cannot appear in a foreign
+key reference.
 
-~~~text
-WORKFLOW_DEFINITION
-WORKFLOW_DEFINITION_VERSION
-WORKFLOW_NODE_DEFINITION
-WORKFLOW_EDGE_DEFINITION
-FSM_DEFINITION
-FSM_STATE
-FSM_TRANSITION
-~~~
-
-Definitions are immutable after publication.
-
-## Flow runtime entities
+## Flow definition tables
 
 ~~~text
-WORKFLOW_INSTANCE
-STEP_INSTANCE
-STEP_TRANSITION_HISTORY
-WORK_ITEM
-WORK_ASSIGNMENT
-TIMER
-COMMAND_DEDUPLICATION
-FLOW_AUDIT_EVENT
-FLOW_OUTBOX_EVENT
+workflow_definition        workflow_version
+step_definition            transition_definition
+fsm_definition             fsm_version
+fsm_state_definition       fsm_transition_definition
 ~~~
 
-## ISRP bindings
+Immutable after publication.
+
+## Runtime tables
 
 ~~~text
-ISRP_REQUEST.workflow_instance_id
-ISRP_ASSESSMENT.workflow_instance_id
-REQUIREMENT_WORK_PACKAGE.step_instance_id
-REQUIREMENT_WORK_PACKAGE.work_item_id
+isrp_request               isrp_assessment        workflow_fact_history
+step_instance              step_attempt
+work_assignment            work_candidate
+signal_receipt             automation_job         durable_timer
+workflow_command
 ~~~
 
-Flow uses:
+There is no workflow instance. `isrp_request` and `isrp_assessment` are the two
+things this application orchestrates, so they are the two tables that carry
+orchestration state, and every other runtime row names one of them through
+`(owner_type, owner_id)`:
 
 ~~~text
-business_type
-business_key
-correlation_id
+owner_type   ISRP_REQUEST | ISRP_ASSESSMENT
+owner_id     the id of that row
 ~~~
 
-Example:
+Ids are not unique across the two tables, so both columns are always carried
+and every uniqueness rule includes both: `step_instance` is unique on
+`(owner_type, owner_id, step_definition_id)`.
+
+There is no work-item table. A unit of human work is a `step_instance` plus its
+`work_assignment` rows. There is no step-transition-history table either;
+per-node history is the shared event log plus `step_attempt`.
+
+## Shared with ISRP
 
 ~~~text
-business_type = ISRP_ASSESSMENT
-business_key = ASMT-1002
-correlation_id = ISR-100
+event_log                  inbox_event            outbox_event
+webhook_subscription       outbox_delivery
 ~~~
+
+See Part XII.
+
+## Bindings
+
+~~~text
+isrp_assessment.request_id                 -> isrp_request.id
+isrp_assessment.parent_step_instance_id    -> step_instance.id
+REQUIREMENT_WORK_PACKAGE.step_instance_id  -> step_instance.id
+~~~
+
+Real foreign keys, because there is one schema in one database. The earlier
+`REQUIREMENT_WORK_PACKAGE.work_item_id` binding is removed: it referenced a
+table that does not exist.
+
+An assessment belongs to exactly one request, and that foreign key is the whole
+of the relationship. There is no relationship type, no relationship key and no
+root pointer: there are two levels, and the second one is this. The opaque
+`business_type` and `business_key` are gone with them, because the reference
+they stood in for is now the row itself.
+
+Correlation is derived rather than supplied. Every event of a request and of
+its assessments carries `ISRP_REQUEST:<request_id>`, so a determination on an
+assessment and the transition it caused in the request read as one thread.
 
 ## Execution modes
 
@@ -872,7 +899,6 @@ description
 owning_org_id
 status
 step_instance_id
-work_item_id
 due_at
 revision
 created_at
@@ -1601,7 +1627,7 @@ UNIQUE(connector_name, external_issue_id)
 UNIQUE(creation_idempotency_key)
 ~~~
 
-ISRP stores a synchronized summary and link. The external issue-management platform remains authoritative for the issue's native lifecycle. Outbound creation uses the transactional outbox; inbound status updates use INTEGRATION_INBOX_EVENT.
+ISRP stores a synchronized summary and link. The external issue-management platform remains authoritative for the issue's native lifecycle. Outbound creation uses the shared outbox; inbound status updates use the shared inbox. See Part XII.
 
 ## CORRECTIVE_ACTION_PLAN
 
@@ -1816,68 +1842,165 @@ apply_command_id
 
 # Part XII: Audit, idempotency, and integration events
 
-## AUDIT_EVENT
+ISRP does not define its own audit table, outbox or inbox. Embedded, it shares
+Flow's, writing through the engine into the same tables in the same transaction.
+One ordered log, one delivery mechanism, one connector receipt store.
 
-Security and business action audit.
+An earlier revision of this document defined AUDIT_EVENT, OUTBOX_EVENT and
+INTEGRATION_INBOX_EVENT as ISRP-owned tables. Under the embedded architecture
+that produced two of everything: two orderings that could not be reconciled, two
+delivery workers, two dead-letter surfaces, and a direct name collision on
+`outbox_event`. Those entities are replaced by the shared ones below.
+
+## EVENT_LOG
+
+One log for the whole application. Domain events and execution events are
+written against the same aggregate, in one sequence: a reviewer's determination
+and the step transition it caused sit next to each other, in order. There is no
+reserved aggregate type, and in particular no `WORKFLOW`; reserving one was what
+forced the two into separate streams.
 
 ~~~text
-audit_event_id
-event_type
-aggregate_type
+event_id
+aggregate_type            ISRP_REQUEST | ISRP_ASSESSMENT | ISRP_FINDING | ...
 aggregate_id
-actor_id
+sequence_number           dense per aggregate
+step_instance_id          set when the event concerns a node; nullable
+event_type
+actor
 actor_org_id
 actor_role
-occurred_at
 correlation_id
 command_id
-workflow_instance_id
-step_instance_id
 previous_revision
 new_revision
 changed_fields_json
 reason_reference
 source_channel
+payload_json
+created_at
 ~~~
 
-Audit events explain who performed an action. They are not substitutes for immutable business records.
+Constraint: `UNIQUE(aggregate_type, aggregate_id, sequence_number)`.
 
-Important event types include:
+ISRP writes through the engine, never with its own SQL, because sequence
+allocation and the event-to-outbox pairing must not be reimplemented:
+
+~~~python
+engine.record_event(
+    "ISRP_ASSESSMENT", assessment_id, "REVIEWER_DETERMINATION_RECORDED",
+    actor=current_actor, correlation_id=request_number,
+    previous_revision=before, new_revision=after,
+    changed_fields={"current_determination_id": determination_id},
+    payload={"work_package_id": work_package_id},
+)
+~~~
+
+`WORKFLOW` is reserved for Flow. ISRP passing it is refused, which is what keeps
+the two sequences from interfering.
+
+Important ISRP event types:
 
 ~~~text
-REQUEST_SUBMITTED
-REQUEST_STATUS_CHANGED
-ASSESSMENT_CREATED
-ASSESSMENT_STATUS_CHANGED
-REQUIREMENT_SELECTED
-REQUIREMENT_SCOPE_CHANGED
-WORK_PACKAGE_ASSIGNED
-RESPONSE_SUBMITTED
-CLARIFICATION_REQUESTED
-COMMENT_ADDED
-EVIDENCE_ATTACHED
-EVIDENCE_REPLACED
-CITATION_ADDED
-CITATION_SUPERSEDED
-RESPONDER_ASSERTION_RECORDED
-REVIEWER_DETERMINATION_RECORDED
-FINAL_DECISION_RECORDED
-EXCEPTION_ACCEPTED
-FINDING_CREATED
-REMEDIATION_CASE_CREATED
+REQUEST_SUBMITTED              REQUEST_STATUS_CHANGED
+ASSESSMENT_CREATED             ASSESSMENT_STATUS_CHANGED
+REQUIREMENT_SELECTED           REQUIREMENT_SCOPE_CHANGED
+WORK_PACKAGE_ASSIGNED          RESPONSE_SUBMITTED
+CLARIFICATION_REQUESTED        COMMENT_ADDED
+EVIDENCE_ATTACHED              EVIDENCE_REPLACED
+CITATION_ADDED                 CITATION_SUPERSEDED
+RESPONDER_ASSERTION_RECORDED   REVIEWER_DETERMINATION_RECORDED
+FINAL_DECISION_RECORDED        EXCEPTION_ACCEPTED
+FINDING_CREATED                REMEDIATION_CASE_CREATED
 NONCOMPLIANCE_REGISTRATION_REQUESTED
-ISSUE_CREATED
-ISSUE_STATUS_SYNCHRONIZED
-CAP_APPROVED
-CAP_ACTION_COMPLETED
+ISSUE_CREATED                  ISSUE_STATUS_SYNCHRONIZED
+CAP_APPROVED                   CAP_ACTION_COMPLETED
 REMEDIATION_VALIDATION_REQUESTED
 FINDING_VALIDATED
 ~~~
 
-## COMMAND_DEDUPLICATION
+An event explains who performed an action. It is not a substitute for the
+immutable business records in Parts VI to X.
+
+## OUTBOX_EVENT (shared with Flow)
+
+Flow's table. `record_event` writes the outbox row in the same statement as the
+log row, so an ISRP event can never be recorded without its outbound copy. Pass
+`publish=False` for an audit-only event that no consumer should receive.
 
 ~~~text
-command_id
+event_id
+event_type
+aggregate_type
+aggregate_id
+aggregate_version
+correlation_id
+payload_json
+status                    PENDING | CLAIMED | DELIVERED | DEAD_LETTER
+attempts
+max_attempts
+next_attempt_at
+claimed_by
+claimed_at
+last_error
+created_at
+processed_at
+~~~
+
+Constraint: `UNIQUE(event_id)`.
+
+ISRP previously specified
+`UNIQUE(aggregate_type, aggregate_id, aggregate_version, event_type)` for
+emit-once. That constraint cannot hold for Flow's rows, because a single graph
+advance emits several events at one revision. ISRP obtains the identical
+guarantee by deriving `event_id` deterministically from
+`(aggregate_type, aggregate_id, aggregate_version, event_type)` and letting
+`UNIQUE(event_id)` reject the second write.
+
+## INBOX_EVENT (shared with Flow)
+
+Flow's table. ISRP records issue-management receipts through
+`engine.record_inbox_event`, which does not require a workflow, so a provider
+event can be accepted before it is correlated to one.
+
+~~~text
+connector_name
+provider_event_id
+event_type
+correlation_key
+correlation_id
+payload_json
+status                    RECEIVED | PROCESSED | FAILED
+attempts
+received_at
+next_attempt_at
+claimed_by
+claimed_at
+processed_at
+last_error
+~~~
+
+Constraint: `UNIQUE(connector_name, provider_event_id)`.
+
+`engine.claim_inbox_events` and `engine.complete_inbox_event` drive one
+connector runner for ISRP receipts and Flow signals alike. Where an ISRP receipt
+should also advance a workflow, ISRP calls `ingest_external_event` for that
+workflow, which translates it into a signal through the same idempotent command
+path.
+
+## ISRP_COMMAND and command idempotency
+
+A receipt of `{owner_type, owner_id, action, revision}` is stored per
+`command_id`, in columns rather than as a serialized response. A repeated
+command has one effect and returns the aggregate's current state.
+
+ISRP commands that do not reach the orchestration need their own deduplication. Where
+one is needed, ISRP keeps a table of its own:
+
+~~~text
+ISRP_COMMAND
+-------------------
+command_id                primary key
 command_type
 aggregate_type
 aggregate_id
@@ -1887,83 +2010,13 @@ result_reference
 status
 ~~~
 
-Constraint:
-
-~~~text
-PRIMARY KEY(command_id)
-~~~
-
-Repeating a completed command returns or reconstructs the prior result.
-
-## OUTBOX_EVENT
-
-Reliable message waiting for delivery.
-
-~~~text
-event_id
-event_type
-aggregate_type
-aggregate_id
-aggregate_version
-occurred_at
-payload_json
-correlation_id
-published_at
-attempt_count
-next_attempt_at
-claimed_by
-claimed_at
-last_error
-~~~
-
-Constraints:
-
-~~~text
-PRIMARY KEY(event_id)
-
-UNIQUE(
-  aggregate_type,
-  aggregate_id,
-  aggregate_version,
-  event_type
-)
-~~~
-
-Business change, immutable history, audit event, and outbox event commit in one transaction.
-
-## INTEGRATION_INBOX_EVENT
-
-Durable receipt and processing state for an event received from an external provider or connector.
-
-~~~text
-inbox_event_id
-connector_name
-provider_event_id
-event_type
-received_at
-payload_json
-correlation_id
-processing_status
-attempt_count
-next_attempt_at
-claimed_by
-claimed_at
-processed_at
-last_error
-~~~
-
-Constraints:
-
-~~~text
-PRIMARY KEY(inbox_event_id)
-UNIQUE(connector_name, provider_event_id)
-~~~
-
-The raw receipt is persisted before domain handling. Processing is idempotent. If a provider has no event ID, the connector derives a stable deduplication key from provider identifiers and payload identity. Reconciliation uses the same command path as event delivery.
+This is deliberately not shared. Flow's receipt is scoped to a workflow and
+carries a workflow revision, which an ISRP-only command does not have.
 
 ## PROCESSED_EVENT
 
-Consumer idempotency.
+Consumer idempotency, and ISRP's own. A projector records what it has applied;
+that is a consumer concern, not part of the shared write path.
 
 ~~~text
 consumer_name
@@ -1972,11 +2025,10 @@ processed_at
 source_version
 ~~~
 
-Constraint:
+Constraint: `PRIMARY KEY(consumer_name, event_id)`
 
-~~~text
-PRIMARY KEY(consumer_name, event_id)
-~~~
+Because the log is shared, one projector can consume ISRP and Flow events from
+a single stream and record both here.
 
 # Part XIII: RDBMS status projections
 
@@ -2074,8 +2126,7 @@ PRIMARY KEY(assessment_id, phase_code, step_instance_id)
 ~~~text
 Authoritative child change
   -> immutable history
-  -> AUDIT_EVENT
-  -> OUTBOX_EVENT
+  -> record_event writes the shared log row and its outbox row
   -> commit
   -> status projector
        -> ASSESSMENT_STATUS_PROJECTION
@@ -2252,6 +2303,14 @@ Future AI proposals are applied only through deterministic authorized commands. 
 
 # Part XVI: Core transaction invariants
 
+Every sequence below runs in one host-owned transaction covering ISRP records,
+embedded Flow records and the shared log.
+
+`record_event` writes the event-log row and its outbox row in one call, so the
+older "insert AUDIT_EVENT, insert OUTBOX_EVENT" pair is now a single step and an
+event can no longer be recorded without its outbound copy. Pass `publish=False`
+where an event is audit-only.
+
 ## Request or assessment metadata edit
 
 ~~~text
@@ -2259,8 +2318,7 @@ BEGIN
   validate expected revision
   update current aggregate
   increment revision
-  insert AUDIT_EVENT
-  insert OUTBOX_EVENT
+  record_event(aggregate, REQUEST_STATUS_CHANGED, previous/new revision)
 COMMIT
 ~~~
 
@@ -2269,12 +2327,11 @@ COMMIT
 ~~~text
 BEGIN
   validate assignment and draft revision
-  insert immutable RESPONSE_SUBMISSION
+  insert immutable REQUIREMENT_RESPONSE_SUBMISSION
   insert RESPONDER_ASSERTION
   snapshot SUBMISSION_CITATION rows
   update ASSESSMENT_REQUIREMENT current pointers/status/revision
-  insert AUDIT_EVENT
-  insert OUTBOX_EVENT
+  record_event(ISRP_ASSESSMENT, RESPONSE_SUBMITTED, ...)
 COMMIT
 ~~~
 
@@ -2287,8 +2344,7 @@ BEGIN
   insert immutable REQUIREMENT_FINAL_DECISION
   update ASSESSMENT_REQUIREMENT current decision/projections/revision
   create or update FINDING when policy requires
-  insert AUDIT_EVENT
-  insert OUTBOX_EVENT
+  record_event(ISRP_ASSESSMENT, FINAL_DECISION_RECORDED, ...)
 COMMIT
 ~~~
 
@@ -2299,8 +2355,7 @@ BEGIN
   insert immutable EVIDENCE_VERSION
   update EVIDENCE_ITEM.current_version_id
   flag current dependent citations REVALIDATION_REQUIRED
-  insert AUDIT_EVENT
-  insert OUTBOX_EVENT
+  record_event(ISRP_EVIDENCE, EVIDENCE_REPLACED, ...)
 COMMIT
 ~~~
 
@@ -2326,8 +2381,7 @@ BEGIN
   record REGISTER_NONCOMPLIANCE disposition and justification
   create or update REMEDIATION_CASE
   link finding through REMEDIATION_CASE_FINDING
-  insert NONCOMPLIANCE_REGISTRATION_REQUESTED OUTBOX_EVENT
-  insert AUDIT_EVENT
+  record_event(ISRP_FINDING, NONCOMPLIANCE_REGISTRATION_REQUESTED, ...)
 COMMIT
 
 Outbound connector:
@@ -2342,14 +2396,14 @@ Inbound update:
 
 ~~~text
 Connector webhook or reconciliation poll:
-  persist INTEGRATION_INBOX_EVENT using connector_name + provider_event_id
+  persist the shared INBOX_EVENT using connector_name + provider_event_id
   correlate ISSUE_REFERENCE
   update synchronized issue summary and observed status
   if external status is resolved:
       mark remediation case EXTERNALLY_RESOLVED or VALIDATION_PENDING
       create deterministic ISRP validation work
       do not close finding
-  insert AUDIT_EVENT and OUTBOX_EVENT
+  record_event(ISRP_REMEDIATION_CASE, ISSUE_STATUS_SYNCHRONIZED, ...)
   mark inbox event processed
 ~~~
 
@@ -2443,11 +2497,13 @@ METADATA_CHANGE_PROPOSAL
 PROPOSAL_EVIDENCE_SOURCE
 PROPOSAL_DECISION
 
-COMMAND_DEDUPLICATION
-AUDIT_EVENT
-OUTBOX_EVENT
-INTEGRATION_INBOX_EVENT
+ISRP_COMMAND
 PROCESSED_EVENT
+
+created by Flow's migration, written by both:
+EVENT_LOG
+OUTBOX_EVENT
+INBOX_EVENT
 
 REQUEST_STATUS_PROJECTION
 ASSESSMENT_STATUS_PROJECTION

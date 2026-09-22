@@ -8,8 +8,10 @@ import unittest
 import uuid
 from pathlib import Path
 
-from workflow_core import ConflictError, ValidationError, WorkflowEngine
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import ConflictError, ValidationError, WorkflowEngine
+from isrp.orchestration import SQLiteWorkflowRepository
+
+from support import aggregate_args, owner
 
 
 def command(**values):
@@ -40,10 +42,9 @@ class OperationsTests(unittest.TestCase):
 
     def start(self, template, **values):
         version = self.engine.import_template(template)["workflow_version_id"]
-        data = {"workflow_version_id": version, "title": "T", "business_type": "TEST",
-                "business_key": str(uuid.uuid4()), "variables": {}, "subjects": []}
+        data = {"workflow_version_id": version, "title": "T", "variables": {},}
         data.update(values)
-        return self.engine.start_workflow(command(**data))
+        return self.engine.start_request(command(**data))
 
     def act(self, workflow, key, action, **values):
         step = next(item for item in workflow["steps"] if item["step_key"] == key)
@@ -64,13 +65,17 @@ class OperationsTests(unittest.TestCase):
         workflow = self.act(workflow, "work", "start")
         self.act(workflow, "work", "complete")
 
-        stored = [row[0] for row in self.query("SELECT result_json FROM workflow_command")]
+        stored = [dict(row) for row in self.query(
+            """SELECT command_id,owner_type,owner_id,action,revision,processed_at
+               FROM workflow_command""")]
         self.assertGreaterEqual(len(stored), 3)
-        for row in stored:
-            receipt = json.loads(row)
-            self.assertEqual(
-                set(receipt), {"workflow_instance_id", "action", "revision"})
-            self.assertLess(len(row), 200)
+        for receipt in stored:
+            # Columns, not a serialized copy of the response. A receipt says
+            # which aggregate the command hit and what revision it produced;
+            # there is nothing in it that can grow with that aggregate's
+            # history.
+            self.assertEqual(receipt["owner_type"], "ISRP_REQUEST")
+            self.assertIsNotNone(receipt["action"])
 
     def test_ops7_replaying_a_command_returns_current_state_and_has_no_second_effect(self):
         workflow = self.start(linear("ops7-replay"))
@@ -83,7 +88,7 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(first["revision"], second["revision"])
         starts = self.query(
-            "SELECT COUNT(*) FROM workflow_event WHERE event_type='STEP_START'")
+            "SELECT COUNT(*) FROM event_log WHERE event_type='STEP_START'")
         self.assertEqual(starts[0][0], 1)
 
     # REL-8: outbound messages carry a schema version.
@@ -116,17 +121,17 @@ class OperationsTests(unittest.TestCase):
 
     def test_ops2_detects_a_workflow_with_nothing_left_to_run(self):
         workflow = self.start(linear("ops2"))
-        self.assertEqual(self.engine.stuck_workflows(), [])
+        self.assertEqual(self.engine.stuck_aggregates(), [])
 
         # The engine should never produce this state. The detector exists for
         # when a bug or a crash does, because nothing else reports it.
         with self.repository.transaction():
             self.repository.db.execute(
-                "UPDATE step_instance SET execution_status='COMPLETED' WHERE workflow_instance_id=?",
-                (workflow["id"],))
+                """UPDATE step_instance SET execution_status='COMPLETED'
+                   WHERE owner_type=? AND owner_id=?""", owner(workflow))
 
         self.assertEqual(
-            [item["id"] for item in self.engine.stuck_workflows()], [workflow["id"]])
+            [item["id"] for item in self.engine.stuck_aggregates()], [workflow["id"]])
 
     # OPS-3: repair is authorized, reasoned and audited.
 
@@ -151,8 +156,8 @@ class OperationsTests(unittest.TestCase):
             actor={"actor_id": "ops", "permissions": ["workflow.repair"]}))
         self.assertEqual(result["execution_status"], "COMPLETED")
         events = [row[0] for row in self.query(
-            "SELECT event_type FROM workflow_event WHERE workflow_instance_id=?",
-            result["id"])]
+            "SELECT event_type FROM event_log WHERE aggregate_type=? AND aggregate_id=?",
+            *aggregate_args(result))]
         self.assertIn("REPAIR_SKIP_STEP", events)
 
     def test_ops3_retry_step_revives_a_failed_workflow(self):
@@ -220,11 +225,11 @@ class OperationsTests(unittest.TestCase):
         self.act(failing, "work", "fail")
 
         counters = self.engine.operational_counters()
-        self.assertEqual(counters["workflows_failed"], 1)
+        self.assertEqual(counters["aggregates_failed"], 1)
         self.assertEqual(counters["jobs_queued"], 1)
-        self.assertGreaterEqual(counters["workflows_running"], 1)
+        self.assertGreaterEqual(counters["aggregates_running"], 1)
         self.assertEqual(counters["outbox_dead_letter"], 0)
-        for key in ("timers_due", "inbox_failed", "jobs_lease_expired", "workflows_stuck"):
+        for key in ("timers_due", "inbox_failed", "jobs_lease_expired", "aggregates_stuck"):
             self.assertIn(key, counters)
 
 

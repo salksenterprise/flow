@@ -1,11 +1,21 @@
 # Information Security Review Process
 
-This section defines how the Information Security Review Process (ISRP) embeds
-the generic Flow workflow core. Flow runs in the ISRP application process and
-participates in the application-owned database transaction; it is not a shared
-workflow service.
+This section defines the Information Security Review Process (ISRP), including
+the orchestration it performs. ISRP owns its state machines, dependency graphs,
+durable timers and reliability plumbing as its own code. There is no separate
+workflow engine, service or package.
+
+An earlier revision separated a domain-neutral workflow core from ISRP. That
+core had exactly one consumer, and maintaining the boundary between the two
+produced most of the defects found in review. See
+[Orchestration](orchestration.md) for what the fusion removes and what it
+keeps.
 
 Documents:
+
+- [Orchestration](orchestration.md): how ISRP runs its own state machines,
+  dependency graphs, timers and reliability plumbing. ISRP owns this; there is
+  no separate workflow engine.
 
 - [Architecture](architecture.md): embedded module boundaries, lifecycle model, DAG/FSM responsibilities, actor modes, and parent-child status aggregation.
 - [Workflow visual guide](workflow-visual-guide.md): ASCII walkthrough of request, assessment, and step workflows, plus gap disposition, remediation cases, external issues, CAPs, validation, and status roll-ups.
@@ -34,8 +44,9 @@ Documents:
 15. A finding is owned by the assessment that discovered it and links to one or more affected assessment requirements and subjects.
 16. A remediation case groups one or more findings; issue-management references and corrective action plans belong to the remediation case.
 17. Request-level finding, remediation, issue, and CAP status is derived through the request's assessments rather than duplicated as request-owned records.
-18. External issue creation uses OUTBOX_EVENT; inbound issue updates use INTEGRATION_INBOX_EVENT and idempotent correlation.
+18. External issue creation uses the shared outbox; inbound issue updates use the shared inbox with idempotent correlation.
 19. An external issue reported as resolved creates validation work. It does not automatically close the ISRP finding.
 20. Closure commands validate authoritative findings, remediation cases, CAP actions, issue references, and exceptions according to policy.
 21. The ISRP application owns the connection, transaction, authentication, authorization context, migration invocation, and scheduling of Flow background routines.
 22. ISRP and Flow writes required by one business command commit or roll back together. Stable ISRP-to-Flow relationships may use database-enforced foreign keys.
+23. ISRP and Flow share one event log, one outbox and one inbox. ISRP writes them through the engine, under its own aggregate types; `WORKFLOW` is reserved for Flow. ISRP defines no parallel audit, outbox or inbox table.

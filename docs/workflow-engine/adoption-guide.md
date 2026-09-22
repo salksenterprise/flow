@@ -1,5 +1,10 @@
 # Adopting Flow for Another Business Process
 
+> **Superseded.** ISRP now owns its orchestration directly; there is no separate
+> workflow engine, service or package. This document described that engine and is
+> retained only until its content has been folded into the ISRP design set. See
+> [ISRP Orchestration](../isrp/orchestration.md) for the current design.
+
 ## 1. Purpose
 
 Flow is not limited to reviews, assessments, approvals, or security processes. It can coordinate any long-running process that has:

@@ -276,18 +276,32 @@ Mandatory append-only justification is required for:
 - exception acceptance
 - post-launch scope change
 
-## Workflow events and commands
+## Orchestration commands
 
-Typical ISRP commands to Flow:
+ISRP calls the orchestration directly. There is no work-item concept, and no
+workflow instance: a run belongs to a request or to an assessment, named by the
+pair `(owner_type, owner_id)`.
 
 ~~~text
-START_WORKFLOW
-CREATE_WORK_ITEM
-COMPLETE_WORK_ITEM
-REQUEST_CLARIFICATION
-RESUME_WORK_ITEM
-CANCEL_WORK_ITEM
+engine.start_request(command)              open a request on a published version
+engine.start_assessment(request_id, cmd)   open an assessment under a request
+engine.apply_action(step_id, command)      claim, start, complete, fail a node
+                                           and request_clarification, respond,
+                                           resume through the step FSM
+engine.apply_lifecycle_action(owner, cmd)  move the aggregate's own lifecycle,
+                                           or suspend, resume, terminate it
+engine.update_facts(owner, command)        supply routing facts
+engine.receive_signal(owner, command)      deliver an external occurrence
+engine.record_event(...)                   record an ISRP domain event, on the
+                                           same stream as the execution events
 ~~~
+
+`request_clarification`, `respond` and `resume` are FSM actions on a node, not
+separate commands. Which are permitted is decided by the step FSM the assessment
+template pins.
+
+An ASSESSMENT node opens its assessment itself, from the version named in its
+configuration, so the common case needs no `start_assessment` call at all.
 
 Typical ISRP domain events consumed by the integration layer:
 
@@ -306,12 +320,27 @@ Flow evaluates transitions using configured event names and data conditions. It 
 
 ## Parallel review and joins
 
-Parallel SMEs receive separate Flow work items and ISRP work packages. Join policy is explicit:
+Parallel SMEs receive separate Flow nodes and ISRP work packages. Two of the
+four policies below are Flow join rules; the other two are ISRP patterns built
+from Flow primitives, and naming them alongside the join rules previously
+implied Flow provided them.
 
-- ALL: every required package must reach its configured completion state.
-- ANY: one qualifying package may continue the flow.
-- QUORUM: ISRP calculates the business quorum and emits a qualifying event.
-- DECISION_AUTHORITY: progression waits for a final decision, regardless of SME count.
+Flow join rules, set on a JOIN node:
+
+- `ALL`: every applicable predecessor is satisfied.
+- `ANY`: at least one applicable predecessor is satisfied.
+- `N_OF_M`: at least `required_count` predecessors are satisfied, which covers a
+  fixed quorum.
+
+ISRP patterns:
+
+- Quorum that depends on business rules rather than a count: ISRP calculates it
+  and emits a qualifying event, consumed by a `WAIT_SIGNAL` node.
+- Decision authority: progression waits for a final decision regardless of SME
+  count, which is again a `WAIT_SIGNAL` node fed by ISRP.
+
+Flow also offers `ALL_REQUIRED`, which waits for every predecessor whether or
+not its edge condition selected it.
 
 Flow should not infer agreement among conflicting SME determinations. ISRP resolves conflicts through an approval package or decision rule and then emits the authoritative completion event.
 

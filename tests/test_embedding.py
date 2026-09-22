@@ -1,25 +1,23 @@
-"""The embedding contract: docs/requirements.md section A.
+"""Atomic commit across domain and orchestration writes.
 
-These tests exist because the charter's central claim is that a host
-application can commit a domain write and a workflow transition as one unit.
-That claim is worth nothing until something proves it.
+The central property of the fused design: an application can record a business
+decision and advance its workflow in one transaction, so the two can never
+disagree. That claim is worth nothing until something proves it.
 """
 
 from __future__ import annotations
 
 import sqlite3
-import sys
 import tempfile
 import threading
 import unittest
 import uuid
 from pathlib import Path
 
-from workflow_core import WorkflowEngine
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import WorkflowEngine
+from isrp.orchestration import SQLiteWorkflowRepository
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "embedded-host"))
-from host import ApprovalApp, HostFailure  # noqa: E402
+from approval_app import ApprovalApp, HostFailure
 
 
 class EmbeddingContractTests(unittest.TestCase):
@@ -36,11 +34,11 @@ class EmbeddingContractTests(unittest.TestCase):
     def workflow_count(self) -> int:
         with self.app.transaction() as connection:
             return connection.execute(
-                "SELECT COUNT(*) FROM workflow_instance").fetchone()[0]
+                "SELECT COUNT(*) FROM isrp_request").fetchone()[0]
 
     def event_count(self) -> int:
         with self.app.transaction() as connection:
-            return connection.execute("SELECT COUNT(*) FROM workflow_event").fetchone()[0]
+            return connection.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]
 
     # EMB-1: the host supplies the connection; Flow never opens one.
 
@@ -54,20 +52,19 @@ class EmbeddingContractTests(unittest.TestCase):
         with self.app.transaction() as connection:
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertIn("approval_request", tables)   # the host's
-        self.assertIn("workflow_instance", tables)  # Flow's
+        self.assertIn("approval_request", tables)  # the domain's
+        self.assertIn("isrp_request", tables)      # the orchestrated aggregate
 
     # EMB-2: the host commits; Flow calls no commit or rollback.
 
     def test_emb2_flow_leaves_the_host_transaction_open(self):
         self.app.connection.execute("BEGIN IMMEDIATE")
         with self.app.repository.using(self.app.connection):
-            self.app.engine.start_workflow({
+            self.app.engine.start_request({
                 "command_id": str(uuid.uuid4()),
                 "workflow_version_id": self.app.workflow_version_id,
-                "title": "Uncommitted", "business_type": "APPROVAL_REQUEST",
-                "business_key": "REQ-OPEN", "actor": "test",
-                "variables": {}, "subjects": [],
+                "title": "Uncommitted",
+                "variables": {},
             })
             self.assertTrue(self.app.connection.in_transaction)
         # Still the host's to decide, even after Flow has finished with it.
@@ -80,25 +77,24 @@ class EmbeddingContractTests(unittest.TestCase):
         observer = sqlite3.connect(str(self.path), timeout=5.0)
         try:
             baseline = observer.execute(
-                "SELECT COUNT(*) FROM workflow_instance").fetchone()[0]
+                "SELECT COUNT(*) FROM isrp_request").fetchone()[0]
 
             self.app.connection.execute("BEGIN IMMEDIATE")
             with self.app.repository.using(self.app.connection):
-                self.app.engine.start_workflow({
+                self.app.engine.start_request({
                     "command_id": str(uuid.uuid4()),
                     "workflow_version_id": self.app.workflow_version_id,
-                    "title": "In flight", "business_type": "APPROVAL_REQUEST",
-                    "business_key": "REQ-INFLIGHT", "actor": "test",
-                    "variables": {}, "subjects": [],
+                    "title": "In flight",
+                    "variables": {},
                 })
 
             self.assertEqual(
-                observer.execute("SELECT COUNT(*) FROM workflow_instance").fetchone()[0],
-                baseline, "Flow committed the host's transaction")
+                observer.execute("SELECT COUNT(*) FROM isrp_request").fetchone()[0],
+                baseline, "orchestration committed the caller's transaction")
 
             self.app.connection.execute("COMMIT")
             self.assertEqual(
-                observer.execute("SELECT COUNT(*) FROM workflow_instance").fetchone()[0],
+                observer.execute("SELECT COUNT(*) FROM isrp_request").fetchone()[0],
                 baseline + 1)
         finally:
             observer.close()
@@ -137,15 +133,14 @@ class EmbeddingContractTests(unittest.TestCase):
 
         with self.assertRaises(sqlite3.IntegrityError):
             with self.app.transaction() as connection:
-                workflow = self.app.engine.start_workflow({
+                workflow = self.app.engine.start_request({
                     "command_id": str(uuid.uuid4()),
                     "workflow_version_id": self.app.workflow_version_id,
                     "title": "Duplicate reference",
-                    "business_type": "APPROVAL_REQUEST", "business_key": "REQ-3",
-                    "actor": "test", "variables": {}, "subjects": [],
+                    "actor": "test", "variables": {},
                 })
                 connection.execute(
-                    """INSERT INTO approval_request(reference,title,workflow_instance_id)
+                    """INSERT INTO approval_request(reference,title,request_id)
                        VALUES (?,?,?)""", ("REQ-3", "Duplicate", workflow["id"]))
 
         self.assertEqual(self.workflow_count(), before)
@@ -155,7 +150,7 @@ class EmbeddingContractTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             with self.app.transaction() as connection:
                 connection.execute(
-                    """INSERT INTO approval_request(reference,title,workflow_instance_id)
+                    """INSERT INTO approval_request(reference,title,request_id)
                        VALUES ('REQ-BAD','Points at nothing',987654)""")
 
     # EMB-9: background routines are callable functions the host schedules.
@@ -180,12 +175,10 @@ class EmbeddingContractTests(unittest.TestCase):
                     connection.execute("BEGIN IMMEDIATE")
                     try:
                         with repository.using(connection):
-                            workflow = engine.start_workflow({
+                            workflow = engine.start_request({
                                 "command_id": str(uuid.uuid4()),
                                 "workflow_version_id": version, "title": "Concurrent",
-                                "business_type": "APPROVAL_REQUEST",
-                                "business_key": str(uuid.uuid4()), "actor": "test",
-                                "variables": {}, "subjects": [],
+                                "variables": {},
                             })
                         connection.execute("COMMIT")
                     except Exception as error:  # noqa: BLE001 - recorded below

@@ -4,7 +4,13 @@
 
 ## Purpose
 
-This document defines how request-level and assessment-level statuses are stored and maintained using the same PostgreSQL or Oracle database as the authoritative ISRP model.
+This document defines how request-level and assessment-level statuses are
+stored and maintained in the same database as the authoritative ISRP model, and
+as the embedded Flow tables.
+
+Oracle is the intended production store; SQLite is the verified development and
+test adapter. Oracle remains unproven until its adapter passes the shared
+repository contract suite against a real instance.
 
 The design intentionally separates explicit lifecycle state from derived operational summaries.
 
@@ -87,8 +93,9 @@ ISRP_REQUEST includes:
 request_id
 request_number
 lifecycle_status
+execution_status
+current_stage
 revision
-workflow_instance_id
 created_at
 updated_at
 submitted_at
@@ -103,8 +110,9 @@ assessment_number
 request_id
 assessment_type
 lifecycle_status
+execution_status
+current_stage
 revision
-workflow_instance_id
 started_at
 target_at
 completed_at
@@ -127,7 +135,6 @@ transition_name
 reason
 changed_by
 changed_at
-workflow_instance_id
 step_instance_id
 request_revision
 ~~~
@@ -214,7 +221,7 @@ The lifecycle value remains authoritative on ISRP_ASSESSMENT.
 An assessment can have several active DAG branches:
 
 ~~~text
-Identity SME review: WAITING_FOR_REQUESTOR
+Identity SME review: WAITING_FOR_RESPONSE
 Network SME review: IN_PROGRESS
 Privacy SME review: COMPLETED
 ~~~
@@ -235,7 +242,7 @@ updated_at
 source_version
 ~~~
 
-A PostgreSQL JSONB or Oracle JSON phase summary is acceptable for a compact read model, but the normalized table is easier to index and report.
+An Oracle JSON column, or JSON-encoded text on SQLite, is acceptable for a compact read model, but the normalized table is easier to index and report.
 
 ## Outbox-driven update flow
 
@@ -246,8 +253,7 @@ BEGIN
 
 1. Insert or update authoritative business record
 2. Append immutable domain history
-3. Insert audit event
-4. Insert OUTBOX_EVENT
+3. record_event writes the shared log row and its outbox row
 
 COMMIT
 ~~~
@@ -262,7 +268,7 @@ OUTBOX_EVENT
        -> record PROCESSED_EVENT
 ~~~
 
-Example event types:
+Event types, all from the shared log:
 
 ~~~text
 ASSESSMENT_CREATED
@@ -488,39 +494,51 @@ A rebuild reads authoritative current and history tables and overwrites only der
 
 Incremental processing and a complete rebuild must produce the same projection for the same authoritative database state.
 
-## PostgreSQL and Oracle mapping
+## Adapter portability
 
-The logical model is identical.
+The logical model is identical across adapters, which is what the shared
+repository contract suite exists to prove.
 
-PostgreSQL:
+Oracle, the production target:
 
-- JSONB may hold compact phase or attention summaries.
-- A worker can claim outbox rows with PostgreSQL locking semantics.
-- Projection tables use normal relational indexes.
+- A JSON-capable column may hold compact phase or attention summaries.
+- Outbox rows are claimed with Oracle locking semantics, `SELECT ... FOR UPDATE
+  SKIP LOCKED` being the natural form.
+- TxEventQ may later replace or augment the table relay without changing the
+  projection contract.
 
-Oracle:
+SQLite, development and test:
 
-- An Oracle JSON-capable column may hold compact summaries.
-- A worker can claim outbox rows with Oracle locking semantics.
-- Oracle TxEventQ may later replace or augment the table relay without changing the projection contract.
+- JSON-encoded text columns.
+- One writer, so claiming races that Oracle will expose are hidden here. The
+  contract suite's claiming tests must run with real parallelism before anyone
+  trusts them.
 
-The portable first implementation uses an OUTBOX_EVENT table and the same projector service with database-specific repository adapters.
+A later PostgreSQL adapter, only if a need appears, would use JSONB and the same
+contract.
 
 ## Initial deployment
 
 ~~~text
-PostgreSQL or Oracle
+One Oracle database
   -> authoritative ISRP schemas
-  -> audit/history schemas
-  -> OUTBOX_EVENT
+  -> ISRP history tables
+  -> embedded Flow execution tables
+  -> the shared event log, outbox and inbox
   -> request/assessment projection tables
   -> PROCESSED_EVENT
 
-One status-projector process
-  -> polls outbox
+One status projector, scheduled by the ISRP application
+  -> drains the shared outbox
   -> updates projections
   -> records processed events
   -> reports lag, retries, and errors
 ~~~
+
+The projector is a routine the host schedules, not a separate deployable. It is
+the same host responsibility as driving Flow's timer, job and delivery routines,
+and it reads one outbox carrying both ISRP domain events and Flow execution
+events, so an assessment's progress and its workflow's transitions arrive in one
+ordered stream.
 
 External search, NoSQL, reporting, or vector stores can be added later as additional consumers of the same event contract.

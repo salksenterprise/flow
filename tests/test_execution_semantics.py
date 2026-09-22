@@ -12,8 +12,10 @@ import unittest
 import uuid
 from pathlib import Path
 
-from workflow_core import ValidationError, WorkflowEngine
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import ValidationError, WorkflowEngine
+from isrp.orchestration import SQLiteWorkflowRepository
+
+from support import owner
 
 
 def command(**values):
@@ -32,10 +34,9 @@ class SemanticsTests(unittest.TestCase):
 
     def start(self, template, **values):
         version = self.engine.import_template(template)["workflow_version_id"]
-        data = {"workflow_version_id": version, "title": "T", "business_type": "TEST",
-                "business_key": str(uuid.uuid4()), "variables": {}, "subjects": []}
+        data = {"workflow_version_id": version, "title": "T", "variables": {},}
         data.update(values)
-        return self.engine.start_workflow(command(**data))
+        return self.engine.start_request(command(**data))
 
     def act(self, workflow, key, action, **values):
         step = next(item for item in workflow["steps"] if item["step_key"] == key)
@@ -147,7 +148,7 @@ class SemanticsTests(unittest.TestCase):
         workflow = self.act(workflow, "a", "start")
         workflow = self.act(workflow, "a", "fail")
         self.assertEqual(workflow["execution_status"], "FAILED")
-        self.assertEqual(workflow["status"], "FAILED")
+        self.assertEqual(workflow["execution_status"], "FAILED")
 
     def test_exe10_suspend_policy_holds_the_workflow_for_intervention(self):
         workflow = self.start(self.fan_out("ALL", None, on_failure="SUSPEND"))
@@ -190,32 +191,57 @@ class SemanticsTests(unittest.TestCase):
         workflow = self.act(workflow, "a", "complete")
         self.assertEqual(workflow["execution_status"], "COMPLETED")
 
-    # EXE-15: a child failure policy other than fail-the-parent.
+    # EXE-15: an assessment failure policy other than fail-the-request.
 
-    def test_exe15_child_failure_policy_continue_lets_the_parent_proceed(self):
-        child = self.engine.import_template({
-            "key": "cfp-child", "name": "Child", "version": 1, "publish": True,
+    def test_exe15_assessment_failure_policy_continue_lets_the_request_proceed(self):
+        assessment_version = self.engine.import_template({
+            "key": "afp-assessment", "name": "Assessment", "version": 1, "publish": True,
             "steps": [{"key": "work", "name": "W", "type": "HUMAN_TASK", "configuration": {}},
                       {"key": "end", "name": "E", "type": "END"}],
             "transitions": [{"from_step": "work", "to_step": "end"}],
         })["workflow_version_id"]
-        parent = self.start({
-            "key": "cfp-parent", "name": "Parent", "version": 1, "publish": True,
-            "steps": [{"key": "sub", "name": "Sub", "type": "SUBWORKFLOW",
-                       "configuration": {"child_failure_policy": "CONTINUE"}},
+        request = self.start({
+            "key": "afp-request", "name": "Request", "version": 1, "publish": True,
+            "steps": [{"key": "sub", "name": "Sub", "type": "ASSESSMENT",
+                       "configuration": {
+                           "assessment_workflow_version_id": assessment_version,
+                           "assessment_failure_policy": "CONTINUE"}},
                       {"key": "end", "name": "E", "type": "END"}],
             "transitions": [{"from_step": "sub", "to_step": "end"}],
         })
-        sub = next(item for item in parent["steps"] if item["step_key"] == "sub")
-        child_workflow = self.engine.start_child_workflow(parent["id"], command(
-            workflow_version_id=child, title="Child", variables={}, subjects=[],
-            parent_step_instance_id=sub["id"], expected_revision=parent["revision"]))
-
-        child_workflow = self.act(child_workflow, "work", "start")
-        self.act(child_workflow, "work", "fail")
+        # The ASSESSMENT node opened the assessment itself; nothing external
+        # had to be told to start one.
+        assessment = self.engine.get_assessment(request["assessments"][0]["id"])
+        assessment = self.act(assessment, "work", "start")
+        self.act(assessment, "work", "fail")
 
         self.assertEqual(
-            self.engine.get_workflow(parent["id"])["execution_status"], "COMPLETED")
+            self.engine.get_aggregate(owner(request))["execution_status"], "COMPLETED")
+
+    def test_exe15_an_assessment_node_is_refused_inside_an_assessment(self):
+        """There are two levels, so the third has nowhere to go."""
+        inner = self.engine.import_template({
+            "key": "nested-inner", "name": "Inner", "version": 1, "publish": True,
+            "steps": [{"key": "work", "name": "W", "type": "HUMAN_TASK", "configuration": {}},
+                      {"key": "end", "name": "E", "type": "END"}],
+            "transitions": [{"from_step": "work", "to_step": "end"}],
+        })["workflow_version_id"]
+        nesting = self.engine.import_template({
+            "key": "nested-middle", "name": "Middle", "version": 1, "publish": True,
+            "steps": [{"key": "sub", "name": "Sub", "type": "ASSESSMENT",
+                       "configuration": {"assessment_workflow_version_id": inner}},
+                      {"key": "end", "name": "E", "type": "END"}],
+            "transitions": [{"from_step": "sub", "to_step": "end"}],
+        })["workflow_version_id"]
+        with self.assertRaises(ValidationError) as raised:
+            self.start({
+                "key": "nested-request", "name": "Request", "version": 1, "publish": True,
+                "steps": [{"key": "sub", "name": "Sub", "type": "ASSESSMENT",
+                           "configuration": {"assessment_workflow_version_id": nesting}},
+                          {"key": "end", "name": "E", "type": "END"}],
+                "transitions": [{"from_step": "sub", "to_step": "end"}],
+            })
+        self.assertIn("only appear in a request", str(raised.exception))
 
     # EVT-4 and DEF-8: the guard language.
 
@@ -256,3 +282,82 @@ class SemanticsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecutionModeTests(unittest.TestCase):
+    """Who performs a step, and the AI modes publication refuses.
+
+    This capability was impossible while orchestration was a domain-neutral
+    engine: it had no execution-mode field, so the delivery plan's requirement
+    to reject AI modes at publication could not be enforced anywhere.
+    """
+
+    # Its own fixture, so it does not re-run the suite above.
+    fan_out = staticmethod(SemanticsTests.fan_out)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.repository = SQLiteWorkflowRepository(Path(self.temp.name) / "workflow.db")
+        self.repository.initialize()
+        self.engine = WorkflowEngine(self.repository)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def step_modes(self, version_id):
+        with self.repository.transaction():
+            return {row["step_key"]: row["execution_mode"] for row in
+                    self.repository.db.execute(
+                        "SELECT step_key,execution_mode FROM step_definition "
+                        "WHERE workflow_version_id=?", (version_id,))}
+
+    def test_mode_defaults_from_the_node_type(self):
+        template = {
+            "key": "modes-default", "name": "Modes", "version": 1, "publish": True,
+            "steps": [
+                {"key": "review", "name": "Review", "type": "HUMAN_TASK", "configuration": {}},
+                {"key": "decide", "name": "Decide", "type": "DECISION", "configuration": {}},
+                {"key": "scan", "name": "Scan", "type": "AUTOMATED_TASK",
+                 "configuration": {"handler": "malware.scan"}},
+                {"key": "end", "name": "End", "type": "END"},
+            ],
+            "transitions": [{"from_step": "review", "to_step": "decide"},
+                            {"from_step": "decide", "to_step": "scan"},
+                            {"from_step": "scan", "to_step": "end"}],
+        }
+        modes = self.step_modes(self.engine.import_template(template)["workflow_version_id"])
+        self.assertEqual(modes["review"], "HUMAN")
+        self.assertEqual(modes["decide"], "HUMAN")
+        self.assertEqual(modes["scan"], "AUTOMATION")
+        self.assertIsNone(modes["end"], "the engine drives an END node; nobody performs it")
+
+    def test_an_explicit_mode_is_kept(self):
+        template = self.fan_out("ALL", None)
+        template["steps"][1]["execution_mode"] = "AUTOMATION"
+        modes = self.step_modes(self.engine.import_template(template)["workflow_version_id"])
+        self.assertEqual(modes["a"], "AUTOMATION")
+
+    def test_ai_modes_are_refused_at_publication(self):
+        for mode in ("AI_ASSISTED_HUMAN", "AI_AUTOMATED_SUPERVISED"):
+            with self.subTest(mode=mode):
+                template = self.fan_out("ALL", None)
+                template["steps"][1]["execution_mode"] = mode
+                with self.assertRaises(ValidationError) as raised:
+                    self.engine.import_template(template)
+                message = str(raised.exception)
+                self.assertIn(mode, message)
+                self.assertIn("future", message.lower())
+
+    def test_an_unknown_mode_is_refused(self):
+        template = self.fan_out("ALL", None)
+        template["steps"][1]["execution_mode"] = "TELEPATHY"
+        with self.assertRaises(ValidationError):
+            self.engine.import_template(template)
+
+    def test_an_engine_driven_node_cannot_declare_a_mode(self):
+        template = self.fan_out("ALL", None)
+        joins = next(item for item in template["steps"] if item["key"] == "join")
+        joins["execution_mode"] = "HUMAN"
+        with self.assertRaises(ValidationError) as raised:
+            self.engine.import_template(template)
+        self.assertIn("cannot declare an execution mode", str(raised.exception))

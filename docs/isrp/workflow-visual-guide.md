@@ -782,7 +782,7 @@ ISSUE_REFERENCE
 Later provider event
         | <------------------------------------- Status = RESOLVED
         v
-INTEGRATION_INBOX_EVENT
+Shared INBOX_EVENT
 (deduplicate and correlate)
         |
         v

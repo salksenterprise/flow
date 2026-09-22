@@ -13,8 +13,10 @@ import unittest
 import uuid
 from pathlib import Path
 
-from workflow_core import ConflictError, WorkflowEngine
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import ConflictError, WorkflowEngine
+from isrp.orchestration import SQLiteWorkflowRepository
+
+from support import owner
 
 
 def command(**values):
@@ -72,11 +74,10 @@ class P0DefectTests(unittest.TestCase):
     def start(self, version_id, **values):
         data = {
             "workflow_version_id": version_id, "title": "Test workflow",
-            "business_type": "TEST", "business_key": str(uuid.uuid4()),
             "variables": {}, "subjects": [],
         }
         data.update(values)
-        return self.engine.start_workflow(command(**data))
+        return self.engine.start_request(command(**data))
 
     def act(self, workflow, key, action, **values):
         step = next(item for item in workflow["steps"] if item["step_key"] == key)
@@ -93,7 +94,7 @@ class P0DefectTests(unittest.TestCase):
             linear_template("exe3-deny", lifecycle_fsm=PERMISSIONED_LIFECYCLE))
         workflow = self.start(version)
         with self.assertRaises(ConflictError):
-            self.engine.apply_workflow_action(workflow["id"], command(
+            self.engine.apply_lifecycle_action(owner(workflow), command(
                 action="close", expected_revision=workflow["revision"],
                 actor={"actor_id": "mallory", "permissions": []}))
 
@@ -101,10 +102,10 @@ class P0DefectTests(unittest.TestCase):
         version = self.import_template(
             linear_template("exe3-allow", lifecycle_fsm=PERMISSIONED_LIFECYCLE))
         workflow = self.start(version)
-        result = self.engine.apply_workflow_action(workflow["id"], command(
+        result = self.engine.apply_lifecycle_action(owner(workflow), command(
             action="close", expected_revision=workflow["revision"],
             actor={"actor_id": "alice", "permissions": ["workflow.close"]}))
-        self.assertEqual(result["lifecycle_state"], "CLOSED")
+        self.assertEqual(result["lifecycle_status"], "CLOSED")
 
     # REL-10 / EMB-7: restarting a process alters no workflow or node state.
 
@@ -123,10 +124,10 @@ class P0DefectTests(unittest.TestCase):
 
         self.repository.initialize()  # every API and worker process start does this
 
-        after = self.engine.get_workflow(workflow["id"])
+        after = self.engine.get_aggregate(owner(workflow))
         self.assertEqual(self.execution(after)["work"], "COMPLETED")
 
-    def test_rel10_restart_preserves_completed_custom_lifecycle_state(self):
+    def test_rel10_restart_preserves_completed_custom_lifecycle_status(self):
         lifecycle = {
             "key": "test.rel10-lifecycle", "name": "Archive lifecycle", "version": 1,
             "initial_state": "OPEN",
@@ -138,12 +139,12 @@ class P0DefectTests(unittest.TestCase):
         workflow = self.start(version)
         workflow = self.act(workflow, "work", "start")
         workflow = self.act(workflow, "work", "complete")
-        self.assertEqual(workflow["lifecycle_state"], "ARCHIVED")
+        self.assertEqual(workflow["lifecycle_status"], "ARCHIVED")
 
         self.repository.initialize()
 
         self.assertEqual(
-            self.engine.get_workflow(workflow["id"])["lifecycle_state"], "ARCHIVED")
+            self.engine.get_aggregate(owner(workflow))["lifecycle_status"], "ARCHIVED")
 
     def test_emb7_legacy_database_migrates_once_and_then_stops(self):
         """A 0.2 database still upgrades, and the migration never runs again."""
@@ -167,18 +168,22 @@ class P0DefectTests(unittest.TestCase):
         repository = SQLiteWorkflowRepository(path)
         repository.initialize()
         with repository.transaction():
+            # The 0.2 run had no parent, so the chain lands it in isrp_request.
             migrated = dict(repository.db.execute(
-                "SELECT lifecycle_state,execution_status FROM workflow_instance").fetchone())
+                "SELECT lifecycle_status,execution_status FROM isrp_request").fetchone())
             stamped = repository.db.execute(
                 "SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()
+            tables = {row[0] for row in repository.db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertEqual(migrated["execution_status"], "COMPLETED")
-        self.assertEqual(migrated["lifecycle_state"], "COMPLETED")
+        self.assertEqual(migrated["lifecycle_status"], "COMPLETED")
         self.assertIsNotNone(stamped)
+        self.assertNotIn("workflow_instance", tables)
 
         repository.initialize()  # a second process start must change nothing
         with repository.transaction():
             self.assertEqual(repository.db.execute(
-                "SELECT COUNT(*) FROM workflow_instance").fetchone()[0], 1)
+                "SELECT COUNT(*) FROM isrp_request").fetchone()[0], 1)
 
     # EMB-10: the core is safe to use concurrently from a multi-threaded host.
 
@@ -212,40 +217,37 @@ class P0DefectTests(unittest.TestCase):
         version = self.import_template(
             linear_template("exe11", "TIMER", {"delay_seconds": 3600}))
         workflow = self.start(version)
-        workflow = self.engine.apply_workflow_action(workflow["id"], command(
+        workflow = self.engine.apply_lifecycle_action(owner(workflow), command(
             action="terminate", reason="No longer required",
             expected_revision=workflow["revision"]))
 
         self.assertEqual(workflow["execution_status"], "CANCELLED")
-        self.assertEqual(workflow["status"], "CANCELLED")
         self.assertEqual(self.execution(workflow)["work"], "CANCELLED")
         with self.repository.transaction():
             status = self.repository.db.execute(
-                "SELECT status FROM durable_timer WHERE workflow_instance_id=?",
-                (workflow["id"],)).fetchone()[0]
+                "SELECT status FROM durable_timer WHERE owner_type=? AND owner_id=?",
+                owner(workflow)).fetchone()[0]
         self.assertEqual(status, "CANCELLED")
 
-    def test_exe11_terminate_cascades_to_running_children(self):
-        child_version = self.import_template(linear_template("exe11-child"))
-        parent_version = self.import_template({
-            "key": "exe11-parent", "name": "Parent", "version": 1, "publish": True,
-            "steps": [{"key": "sub", "name": "Sub", "type": "SUBWORKFLOW", "configuration": {}},
+    def test_exe11_terminate_cascades_to_running_assessments(self):
+        assessment_version = self.import_template(linear_template("exe11-assessment"))
+        request_version = self.import_template({
+            "key": "exe11-request", "name": "Request", "version": 1, "publish": True,
+            "steps": [{"key": "sub", "name": "Sub", "type": "ASSESSMENT",
+                       "configuration": {
+                           "assessment_workflow_version_id": assessment_version}},
                       {"key": "end", "name": "End", "type": "END"}],
             "transitions": [{"from_step": "sub", "to_step": "end"}],
         })
-        parent = self.start(parent_version)
-        sub = next(item for item in parent["steps"] if item["step_key"] == "sub")
-        child = self.engine.start_child_workflow(parent["id"], command(
-            workflow_version_id=child_version, title="Child", variables={}, subjects=[],
-            parent_step_instance_id=sub["id"], expected_revision=parent["revision"]))
+        request = self.start(request_version)
+        assessment_id = request["assessments"][0]["id"]
 
-        parent = self.engine.get_workflow(parent["id"])
-        self.engine.apply_workflow_action(parent["id"], command(
-            action="terminate", reason="Parent abandoned",
-            expected_revision=parent["revision"]))
+        self.engine.apply_lifecycle_action(owner(request), command(
+            action="terminate", reason="Request abandoned",
+            expected_revision=request["revision"]))
 
         self.assertEqual(
-            self.engine.get_workflow(child["id"])["execution_status"], "CANCELLED")
+            self.engine.get_assessment(assessment_id)["execution_status"], "CANCELLED")
 
     # EXE-12: a suspended workflow performs no activation, firing or completion.
 
@@ -253,49 +255,54 @@ class P0DefectTests(unittest.TestCase):
         version = self.import_template(
             linear_template("exe12", "TIMER", {"delay_seconds": 0}))
         workflow = self.start(version)
-        workflow = self.engine.apply_workflow_action(workflow["id"], command(
+        workflow = self.engine.apply_lifecycle_action(owner(workflow), command(
             action="suspend", expected_revision=workflow["revision"]))
 
         self.assertEqual(self.engine.process_due_timers(), 0)
-        suspended = self.engine.get_workflow(workflow["id"])
+        suspended = self.engine.get_aggregate(owner(workflow))
         self.assertEqual(suspended["execution_status"], "SUSPENDED")
         self.assertEqual(self.execution(suspended)["work"], "WAITING")
 
-        self.engine.apply_workflow_action(workflow["id"], command(
+        self.engine.apply_lifecycle_action(owner(workflow), command(
             action="resume", expected_revision=suspended["revision"]))
         self.assertEqual(self.engine.process_due_timers(), 1)
         self.assertEqual(
-            self.engine.get_workflow(workflow["id"])["execution_status"], "COMPLETED")
+            self.engine.get_aggregate(owner(workflow))["execution_status"], "COMPLETED")
 
     def test_exe12_suspended_workflow_does_not_release_automation_jobs(self):
         version = self.import_template(
             linear_template("exe12-job", "AUTOMATED_TASK", {"handler": "noop"}))
         workflow = self.start(version)
-        self.engine.apply_workflow_action(workflow["id"], command(
+        self.engine.apply_lifecycle_action(owner(workflow), command(
             action="suspend", expected_revision=workflow["revision"]))
         self.assertEqual(self.engine.claim_automation_jobs("worker-1"), [])
 
     # REL-2: idempotency is checked before revision validation.
 
-    def test_rel2_child_workflow_start_is_idempotent_on_retry(self):
-        child_version = self.import_template(linear_template("rel2-child"))
-        parent_version = self.import_template({
-            "key": "rel2-parent", "name": "Parent", "version": 1, "publish": True,
-            "steps": [{"key": "sub", "name": "Sub", "type": "SUBWORKFLOW", "configuration": {}},
+    def test_rel2_assessment_start_is_idempotent_on_retry(self):
+        assessment_version = self.import_template(linear_template("rel2-assessment"))
+        request_version = self.import_template({
+            "key": "rel2-request", "name": "Request", "version": 1, "publish": True,
+            "steps": [{"key": "sub", "name": "Sub", "type": "ASSESSMENT",
+                       "configuration": {
+                           "assessment_workflow_version_id": assessment_version}},
                       {"key": "end", "name": "End", "type": "END"}],
             "transitions": [{"from_step": "sub", "to_step": "end"}],
         })
-        parent = self.start(parent_version)
-        sub = next(item for item in parent["steps"] if item["step_key"] == "sub")
-        child_command = command(
-            workflow_version_id=child_version, title="Child", variables={}, subjects=[],
-            parent_step_instance_id=sub["id"], expected_revision=parent["revision"])
+        request = self.start(request_version)
+        sub = next(item for item in request["steps"] if item["step_key"] == "sub")
+        assessment_command = command(
+            workflow_version_id=assessment_version, title="Assessment", variables={},
+            parent_step_instance_id=sub["id"], expected_revision=request["revision"])
 
-        first = self.engine.start_child_workflow(parent["id"], child_command)
-        second = self.engine.start_child_workflow(parent["id"], child_command)
+        first = self.engine.start_assessment(request["id"], assessment_command)
+        second = self.engine.start_assessment(request["id"], assessment_command)
 
         self.assertEqual(first["id"], second["id"])
-        self.assertEqual(len(self.engine.get_workflow(parent["id"])["children"]), 1)
+        # One opened by the node itself, one opened explicitly, and the retry
+        # adds nothing.
+        self.assertEqual(
+            len(self.engine.get_aggregate(owner(request))["assessments"]), 2)
 
     # REL-7: retry redelivers only to subscriptions that have not yet succeeded.
 

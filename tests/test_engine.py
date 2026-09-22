@@ -6,12 +6,14 @@ import unittest
 import uuid
 from pathlib import Path
 
-from workflow_core import ConflictError, WorkflowEngine
-from workflow_sqlite import SQLiteWorkflowRepository
+from isrp.orchestration import ConflictError, WorkflowEngine
+from isrp.orchestration import SQLiteWorkflowRepository
+
+from support import aggregate_args
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEMPLATE = json.loads((ROOT / "examples/information-security-review/workflow.json").read_text())
+TEMPLATE = json.loads((ROOT / "isrp/templates/information-security-review.json").read_text())
 
 
 class WorkflowEngineTests(unittest.TestCase):
@@ -26,16 +28,12 @@ class WorkflowEngineTests(unittest.TestCase):
         self.temp.cleanup()
 
     def start(self, command_id: str | None = None, identity: bool = True, network: bool = True):
-        return self.engine.start_workflow({
+        return self.engine.start_request({
             "command_id": command_id or str(uuid.uuid4()),
             "workflow_version_id": self.version_id,
             "title": "External assessment workflow",
-            "business_type": "ISR_ASSESSMENT",
-            "business_key": "ASMT-502",
-            "correlation_id": "ISR-REQ-200",
             "actor": "isr.service",
             "variables": {"identity_review_required": identity, "network_review_required": network},
-            "subjects": [],
         })
 
     def action(self, workflow: dict, step_key: str, action: str, command_id: str | None = None):
@@ -60,7 +58,7 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(states["join_sme"], "NOT_READY")
         for key in ("identity_sme", "network_sme", "architecture_sme", "consolidate", "build", "validate"):
             workflow = self.complete(workflow, key)
-        self.assertEqual(workflow["status"], "COMPLETED")
+        self.assertEqual(workflow["execution_status"], "COMPLETED")
 
     def test_conditional_branch(self):
         workflow = self.start(identity=False)
@@ -84,7 +82,7 @@ class WorkflowEngineTests(unittest.TestCase):
         first = self.start(command_id=command_id)
         second = self.start(command_id=command_id)
         self.assertEqual(first["id"], second["id"])
-        self.assertEqual(len(self.engine.list_workflows()), 1)
+        self.assertEqual(len(self.engine.list_requests()), 1)
 
     def test_revision_conflict(self):
         workflow = self.start()
@@ -99,7 +97,8 @@ class WorkflowEngineTests(unittest.TestCase):
         workflow = self.start()
         with self.repository.transaction():
             events = self.repository.db.execute(
-                "SELECT COUNT(*) FROM workflow_event WHERE workflow_instance_id=?", (workflow["id"],)
+                "SELECT COUNT(*) FROM event_log WHERE aggregate_type=? AND aggregate_id=?",
+                aggregate_args(workflow),
             ).fetchone()[0]
             outbox = self.repository.db.execute("SELECT COUNT(*) FROM outbox_event").fetchone()[0]
         self.assertEqual(events, outbox)

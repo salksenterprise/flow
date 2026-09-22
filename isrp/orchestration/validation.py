@@ -6,13 +6,14 @@ from .errors import ValidationError
 from .rules import validate_rule
 from .calendars import validate_calendar
 from .states import (
-    BREACH_ACTIONS, CHILD_FAILURE_POLICIES, FAILURE_POLICIES, STATE_CATEGORIES,
+    ASSESSMENT_FAILURE_POLICIES, BREACH_ACTIONS, EXECUTION_MODES, FAILURE_POLICIES,
+    FUTURE_EXECUTION_MODES, PERFORMED_STEP_TYPES, STATE_CATEGORIES,
 )
 
 
 STEP_TYPES = {
     "HUMAN_TASK", "DECISION", "AUTOMATED_TASK", "FORK", "JOIN",
-    "SUBWORKFLOW", "WAIT_SIGNAL", "TIMER", "MILESTONE", "END",
+    "ASSESSMENT", "WAIT_SIGNAL", "TIMER", "MILESTONE", "END",
 }
 JOIN_RULES = {"ALL", "ANY", "N_OF_M", "ALL_REQUIRED"}
 
@@ -69,17 +70,38 @@ def validate_template(template: dict[str, Any]) -> None:
             raise ValidationError(f"TIMER step '{step['key']}' requires configuration.delay_seconds")
         if step.get("fsm"):
             validate_fsm(step["fsm"], f"Step FSM '{step['key']}'")
+        mode = step.get("execution_mode")
+        if mode is not None:
+            if mode in FUTURE_EXECUTION_MODES:
+                raise ValidationError(
+                    f"Step '{step['key']}' declares execution mode '{mode}'. AI modes "
+                    "are reserved for separately published future definitions and are "
+                    "rejected by the current release.")
+            if mode not in EXECUTION_MODES:
+                raise ValidationError(
+                    f"Step '{step['key']}' declares unknown execution mode '{mode}'. "
+                    f"Supported: {', '.join(sorted(EXECUTION_MODES))}")
+            if step.get("type") not in PERFORMED_STEP_TYPES:
+                raise ValidationError(
+                    f"Step '{step['key']}' is a {step.get('type')} node, which the "
+                    "engine drives; it cannot declare an execution mode")
         configuration = step.get("configuration", {})
         on_failure = configuration.get("on_failure")
         if on_failure is not None and on_failure not in FAILURE_POLICIES:
             raise ValidationError(
                 f"Step '{step['key']}' declares unknown on_failure '{on_failure}'. "
                 f"Supported: {', '.join(sorted(FAILURE_POLICIES))}")
-        child_policy = configuration.get("child_failure_policy")
-        if child_policy is not None and child_policy not in CHILD_FAILURE_POLICIES:
+        if step.get("type") == "ASSESSMENT" and not configuration.get(
+                "assessment_workflow_version_id"):
             raise ValidationError(
-                f"Step '{step['key']}' declares unknown child_failure_policy "
-                f"'{child_policy}'. Supported: {', '.join(sorted(CHILD_FAILURE_POLICIES))}")
+                f"ASSESSMENT step '{step['key']}' requires "
+                "configuration.assessment_workflow_version_id")
+        assessment_policy = configuration.get("assessment_failure_policy")
+        if assessment_policy is not None and assessment_policy not in ASSESSMENT_FAILURE_POLICIES:
+            raise ValidationError(
+                f"Step '{step['key']}' declares unknown assessment_failure_policy "
+                f"'{assessment_policy}'. Supported: "
+                f"{', '.join(sorted(ASSESSMENT_FAILURE_POLICIES))}")
         validate_calendar(configuration.get("calendar"), f"Step '{step['key']}' calendar")
         due = configuration.get("due_in_seconds")
         if due is not None and (not isinstance(due, int) or isinstance(due, bool) or due <= 0):

@@ -38,13 +38,16 @@ Deliver:
 - Application-generated identifiers
 - UTC timestamp conventions
 - Revision-based optimistic locking
-- Audit-event and outbox tables
+- Flow's migration invoked from the ISRP migration process, which creates the
+  shared event log, outbox and inbox; ISRP builds none of its own
+- ISRP_COMMAND and PROCESSED_EVENT, the two reliability tables ISRP does own
 - Repository interfaces and SQLite reference adapters
 - Transaction and idempotency test harness
 
 Acceptance:
 
-- A business update, audit event, and outbox event commit atomically.
+- A business update, its shared-log event and its outbox row commit atomically
+  in one host-owned transaction, alongside any Flow execution write.
 - Concurrent edits produce a detectable revision conflict.
 - Repeating an idempotent command does not duplicate data.
 - No acceptance result from SQLite is represented as Oracle certification.
@@ -109,8 +112,9 @@ Deliver:
 - Step assignment, work, clarification, response, submission, and completion states
 - Conditional edges
 - Parallel SME branches
-- ALL and ANY joins
-- Durable timers and escalation signals
+- ALL, ANY, N_OF_M and ALL_REQUIRED joins, as Flow provides them
+- Quorum and decision-authority progression as WAIT_SIGNAL nodes fed by ISRP
+- Durable timers, business calendars, due times and breach escalation
 
 Acceptance:
 
@@ -168,7 +172,10 @@ Deliver:
 - Deterministic evidence validation, hashing, storage, and supported text extraction
 - Automated connector tasks
 - Retry, timeout, failure, and manual-review policies
-- Workflow publication validation that rejects AI modes in current ISRP definitions
+- Validation that rejects AI modes in current ISRP definitions. Flow has no
+  execution-mode field and its publication validation cannot enforce this, so
+  ISRP validates its own templates before importing them. See the open
+  dependencies in [Architecture](architecture.md).
 
 Acceptance:
 
@@ -213,7 +220,7 @@ Deliver:
 - Noncompliance eligibility and closure policies
 - Issue-management outbox connector using NONCOMPLIANCE_REGISTRATION_REQUESTED
 - External issue references owned by remediation cases
-- INTEGRATION_INBOX_EVENT for idempotent provider updates
+- Idempotent provider updates through the inbox shared with Flow
 - Status synchronization and reconciliation
 - Deterministic validation work after external resolution
 - Finding, remediation, issue, CAP, and validation-pending projections
