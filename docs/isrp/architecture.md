@@ -2,11 +2,15 @@
 
 ## Purpose
 
-ISRP handles intake, categorization, assessment execution, requirement review, validation, findings, issue integration, and review closure. Flow remains a generic workflow execution service and contains no information-security-specific rules or records.
+ISRP handles intake, categorization, assessment execution, requirement review,
+validation, findings, issue integration, and review closure. Flow remains a
+generic workflow execution core with no information-security-specific rules or
+records. ISRP embeds that core in-process; Flow is not deployed as a shared
+workflow service.
 
-## Service boundaries
+## Embedded architecture and ownership boundaries
 
-### ISRP service
+### ISRP host application
 
 Owns:
 
@@ -21,7 +25,7 @@ Owns:
 - Reviewer decisions, findings, remediation cases, CAPs, and external issue references
 - Parent-child roll-up policy
 
-### Workflow service
+### Embedded Flow core
 
 Owns:
 
@@ -31,9 +35,22 @@ Owns:
 - Step FSM definitions and transitions
 - Human and automated work items
 - Assignments, timers, retries, and escalation signals
-- Idempotent commands, audit events, outbox events, and webhooks
+- Idempotent commands, execution audit events, and execution outbox events
 
-The integration contract uses opaque references such as:
+The boundary is logical even though both modules run in one process and use one
+database. The host owns the connection and transaction. Flow joins that
+transaction and never commits, rolls back, or closes the host connection.
+
+~~~text
+ISRP command
+  -> begin host transaction
+  -> update ISRP domain records
+  -> call embedded Flow engine
+  -> Flow updates execution records and appends its outbox events
+  -> host commits or rolls back both sets of changes together
+~~~
+
+ISRP supplies stable business references such as:
 
 ~~~text
 business_type = ISRP_REQUEST
@@ -41,7 +58,24 @@ business_key  = ISR-10042
 correlation_id = ISR-10042
 ~~~
 
-The workflow service does not enforce ISRP requirement or assessment semantics.
+The embedded Flow core does not enforce ISRP requirement or assessment
+semantics. ISRP records may hold foreign keys to Flow workflow and step
+instances because the schemas share one database. Flow continues to treat
+ISRP identifiers and payloads as opaque domain values.
+
+### Deployment and database decision
+
+~~~text
+Local development and tests    SQLite adapter, currently executable
+Intended production            Oracle adapter, not yet implemented or verified
+Later optional adapter         PostgreSQL, only if a demonstrated need appears
+~~~
+
+Oracle conformance cannot be proven in the local environment. No document or
+release may claim Oracle support until the Oracle adapter passes the same
+repository contract suite against a real Oracle instance. The ISRP application
+invokes Flow migrations through its own deployment process and schedules Flow's
+timer, job, and outbox routines through host-managed jobs.
 
 ## Runtime hierarchy
 
@@ -184,7 +218,11 @@ Child records remain authoritative. Parent projections can be rebuilt from child
 
 ## Requirement execution boundary
 
-Flow orchestrates when requirement work starts, who receives it, when clarification or approval is required, and when downstream DAG nodes may activate. ISRP owns the requirement catalog, selected assessment requirements, work packages, responses, evidence, comments, determinations, and final decisions.
+The embedded Flow core orchestrates when requirement work starts, who receives
+it, when clarification or approval is required, and when downstream DAG nodes
+may activate. ISRP owns the requirement catalog, selected assessment
+requirements, work packages, responses, evidence, comments, determinations,
+and final decisions.
 
 A Flow step references an ISRP work package by opaque business keys:
 
@@ -291,7 +329,11 @@ The issue-management platform remains authoritative for its issue and plan execu
 
 ## RDBMS-first status projections
 
-The initial implementation keeps authoritative records, outbox events, and request/assessment status projections in the same PostgreSQL or Oracle database. A separate NoSQL or search store is not required.
+The production design keeps authoritative ISRP records, embedded Flow records,
+outbox events, and request/assessment status projections in the same Oracle
+database. Local development and contract verification use SQLite. A separate
+NoSQL or search store is not required, and PostgreSQL is not part of the
+initial production path.
 
 Lifecycle status is authoritative and changes only through an authorized FSM transition. Operational summaries are derived:
 
@@ -337,7 +379,7 @@ Requirement responses use different semantics:
 
 - Commands carry client-generated idempotency keys.
 - Transitions validate the current revision before committing.
-- Business updates and outbox records commit in the same database transaction.
+- ISRP business updates, Flow execution updates, audit records, and outbox records commit in the same host-owned database transaction.
 - Consumers handle events idempotently.
 - External issue creation and updates never run inside the primary business transaction.
 - Outbound effects use OUTBOX_EVENT; inbound provider events use INTEGRATION_INBOX_EVENT.

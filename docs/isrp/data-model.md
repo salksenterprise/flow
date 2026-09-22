@@ -2,7 +2,9 @@
 
 ## Purpose and authority
 
-This is the single canonical logical data model for the Information Security Review Process (ISRP) and its integration with the generic Flow workflow service.
+This is the single canonical logical data model for the Information Security
+Review Process (ISRP) and its integration with the embedded generic Flow
+workflow core.
 
 Other ISRP documents describe behavior, workflow, delivery phases, or visual examples. When an entity name, relationship, field, or constraint differs, this document is authoritative.
 
@@ -22,7 +24,7 @@ The model covers:
 - findings, affected subjects, remediation cases, issues, CAPs, exceptions, validation, and closure
 - audit, idempotency, outbox, and processed events
 - request and assessment status projections
-- PostgreSQL and Oracle portability
+- Oracle production targeting, SQLite local verification, and adapter portability
 - current deterministic scope and future AI extensions
 
 ## Current and future phase boundary
@@ -53,7 +55,15 @@ Future AI output is always a proposal. It is not an authoritative responder asse
 
 ## Storage strategy
 
-Use PostgreSQL as the initial authoritative store. Support Oracle through separate repository adapters and dialect-specific migrations.
+Use Oracle as the intended production authoritative store. The Oracle adapter
+and dialect migrations are not yet implemented or locally verifiable. Use
+SQLite as the executable development, test, and repository-contract adapter.
+PostgreSQL may follow Oracle through a separate adapter only if a demonstrated
+need appears.
+
+The logical model and repository contracts are database-neutral, but only an
+adapter that passes the shared contract suite against its real database may be
+called supported. SQLite passing locally is not evidence that Oracle works.
 
 Use NoSQL, search, reporting, and vector stores only as derived, disposable, rebuildable projections. They are never the source of truth for transitions, authorization, decisions, evidence versions, or audit.
 
@@ -67,14 +77,14 @@ Large evidence files live in controlled object/document storage. The RDBMS store
 - Store states and types as bounded strings rather than database-native enums.
 - Use optimistic revision columns on mutable aggregates.
 - Keep business rules in services rather than triggers or stored procedures.
-- Map flexible data to PostgreSQL JSONB and an Oracle JSON-capable column.
+- Map flexible data to an Oracle JSON-capable column in production and JSON-encoded TEXT in SQLite; a future PostgreSQL adapter may use JSONB.
 - Keep frequently joined, filtered, constrained, authorized, or reported values in normal columns.
 - Use separate adapters for JSON operators, locking, outbox claiming, and migrations.
 - Use explicit bridge tables instead of unconstrained entity_type/entity_id associations where referential integrity matters.
 
 ## Ownership boundaries
 
-### ISRP service owns
+### ISRP host application owns
 
 - requests and assessments
 - subjects and scope
@@ -88,7 +98,7 @@ Large evidence files live in controlled object/document storage. The RDBMS store
 - audit and business outbox events
 - request and assessment status projections
 
-### Flow service owns
+### Embedded Flow core logically owns
 
 - workflow definitions and immutable versions
 - DAG node and edge definitions
@@ -98,7 +108,11 @@ Large evidence files live in controlled object/document storage. The RDBMS store
 - timers, retries, and execution transitions
 - Flow audit and Flow outbox events
 
-ISRP stores Flow identifiers as opaque references. When deployed as separate services, there are no cross-database foreign keys.
+ISRP and Flow share the host database but retain separate logical ownership.
+Stable bindings such as request-to-workflow, assessment-to-workflow, and work
+package-to-step may use database-enforced foreign keys. Flow does not traverse
+those relationships to interpret ISRP records; business keys, facts, signals,
+and event payloads remain opaque to the engine.
 
 ## High-level relationship view
 
@@ -522,7 +536,10 @@ correlation_id
 
 # Part IV: Generic Flow model and ISRP bindings
 
-The Flow service maintains its own canonical schema. The following list records the integration boundary.
+The embedded Flow package maintains its canonical tables under an ISRP-owned
+database schema or configured table prefix. The ISRP deployment invokes Flow's
+migration entry point from the host migration process. The following list
+records the logical integration boundary.
 
 ## Flow definition entities
 
@@ -2089,7 +2106,10 @@ It may embed assessment and status summaries for UI reads but is not authoritati
 
 ## Search projection
 
-Search documents may combine requirement text, response text, citation blurbs, comments, and subject names. PostgreSQL full-text search, Oracle Text, or an external search engine may implement it.
+Search documents may combine requirement text, response text, citation blurbs,
+comments, and subject names. Oracle Text or an external search engine may
+implement the production projection. SQLite search may support local
+development; a future PostgreSQL adapter may use PostgreSQL full-text search.
 
 ## Reporting projection
 
@@ -2434,4 +2454,7 @@ ASSESSMENT_STATUS_PROJECTION
 ASSESSMENT_ACTIVE_PHASE
 ~~~
 
-Flow definition and runtime entities remain owned by the separate generic Flow service.
+Flow definition and runtime entities remain logically owned by the embedded
+generic Flow package even though they share the ISRP process, database, and
+transaction. ISRP code references Flow through its public engine and repository
+contracts rather than writing Flow-owned tables directly.

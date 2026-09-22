@@ -4,7 +4,10 @@
 
 ## Purpose
 
-This document explains how the generic Flow workflow service and the ISRP requirements domain work together. Flow controls orchestration and work progression. ISRP controls the meaning, selection, response, evidence, review, and decision history of security requirements.
+This document explains how the embedded generic Flow workflow core and the ISRP
+requirements domain work together inside one host application. Flow controls
+orchestration and work progression. ISRP controls the meaning, selection,
+response, evidence, review, and decision history of security requirements.
 
 ## Responsibility boundary
 
@@ -50,7 +53,11 @@ ISRP Request
   -> request roll-up and closure
 ~~~
 
-The workflow instance stores opaque business references. It does not use foreign keys into the ISRP database.
+Flow stores opaque ISRP business keys and never interprets the referenced
+domain records. Because Flow is embedded in the ISRP database, ISRP binding
+columns may use foreign keys to Flow workflow and step instances. Directional
+ownership remains clear: ISRP may reference Flow execution identities; Flow
+does not acquire dependencies on ISRP tables or concepts.
 
 ## Catalog structure
 
@@ -336,7 +343,13 @@ NOT_MET
   -> attention REMEDIATION_REQUIRED
 ~~~
 
-A child requirement change updates assessment projections. Assessment changes update request projections. Parent states summarize inner execution but do not mirror every child state. The initial implementation stores these projections in the same PostgreSQL or Oracle database and maintains them from OUTBOX_EVENT records. Controlled closure operations always revalidate authoritative child records. See [RDBMS status projections](status-projections.md).
+A child requirement change updates assessment projections. Assessment changes
+update request projections. Parent states summarize inner execution but do not
+mirror every child state. The production design stores these projections in
+the same Oracle database as the ISRP and embedded Flow records; local execution
+uses SQLite. OUTBOX_EVENT records drive deterministic projection updates.
+Controlled closure operations always revalidate authoritative child records.
+See [RDBMS status projections](status-projections.md).
 
 ## From requirement gap to remediation
 

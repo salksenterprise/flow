@@ -3,8 +3,10 @@
 ## Delivery principles
 
 - Deliver vertical slices with demonstrable business behavior.
-- Keep ISRP domain logic out of the generic workflow service.
-- Start with PostgreSQL; validate Oracle portability continuously and implement the Oracle adapter when required.
+- Keep ISRP domain logic out of the embedded generic Flow core.
+- Embed Flow in the ISRP application so domain and execution writes share one host-owned transaction.
+- Target Oracle for production. Use SQLite for local development and automated contract tests; do not claim Oracle support until an Oracle environment runs the shared adapter and concurrency suites.
+- Consider PostgreSQL only after Oracle and only for an approved need.
 - Treat workflow definitions and requirement versions as immutable after publication.
 - Make every command idempotent and every mutable aggregate revision-controlled.
 - Add NoSQL or search only for a measured read, search, or reporting need in the current phase; AI retrieval remains future scope.
@@ -14,27 +16,30 @@
 
 Deliver:
 
-- Architecture decision records for service boundaries, PostgreSQL-first storage, Oracle portability, and projection strategy
-- ISRP-to-workflow command and event contract
+- Architecture decision records for embedded module boundaries, host-owned transactions, Oracle targeting, local-verification limits, and projection strategy
+- ISRP-to-Flow in-process command and event contract
 - Status, actor-mode, and identifier vocabularies
 - Initial authorization and organization model
 - Nonfunctional targets for availability, latency, retention, and audit
 
 Acceptance:
 
-- ISRP can create and correlate a workflow without workflow-core importing ISRP code.
+- ISRP can create and correlate a workflow in the same transaction without workflow-core importing ISRP code.
 - Ownership of every authoritative data element is documented.
+- The documentation distinguishes locally verified SQLite behavior from planned Oracle behavior.
 
 ## Iteration 1: Persistence foundation
 
 Deliver:
 
-- PostgreSQL migrations
+- Database-neutral migration ordering and ownership contract
+- SQLite reference migrations for local development and automated tests
+- Oracle migration design, with execution deferred until an Oracle environment is available
 - Application-generated identifiers
 - UTC timestamp conventions
 - Revision-based optimistic locking
 - Audit-event and outbox tables
-- Repository interfaces and PostgreSQL adapters
+- Repository interfaces and SQLite reference adapters
 - Transaction and idempotency test harness
 
 Acceptance:
@@ -42,6 +47,7 @@ Acceptance:
 - A business update, audit event, and outbox event commit atomically.
 - Concurrent edits produce a detectable revision conflict.
 - Repeating an idempotent command does not duplicate data.
+- No acceptance result from SQLite is represented as Oracle certification.
 
 ## Iteration 2: Request intake
 
@@ -242,11 +248,16 @@ Acceptance:
 - Privileged actions and definition changes are auditable.
 - Retention and legal-hold rules do not destroy required evidence.
 
-## Iteration 12: Scale and additional stores
+## Iteration 12: Production database certification and scale options
 
-Deliver as justified:
+Required for production:
 
 - Oracle persistence adapter and dialect migrations
+- Oracle repository-contract, concurrency, migration, failover, and recovery tests in an externally provided Oracle environment
+
+Deliver only as justified by measured need:
+
+- PostgreSQL adapter only if separately approved after Oracle
 - NoSQL request and assessment projections
 - Search index
 - Reporting warehouse feed
@@ -257,7 +268,8 @@ Acceptance:
 
 - Authoritative writes still complete in one RDBMS transaction.
 - Every projection can be rebuilt from authoritative data and events.
-- PostgreSQL and Oracle adapters pass the same repository contract tests.
+- Oracle passes the same repository contract suite as SQLite before production use.
+- PostgreSQL, if built, passes the same suite without changing core semantics.
 
 
 ## Future phase: AI-assisted ISRP
@@ -303,7 +315,7 @@ Release 3 — Deterministic automation and governance:
 - Iterations 8 through 11
 - Adds deterministic automation, roll-ups, issue integration, and enterprise controls
 
-Release 4 — Scale options:
+Release 4 — Oracle certification and scale options:
 
 - Iteration 12
 - Adds only the storage and performance capabilities justified by production evidence
