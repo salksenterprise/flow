@@ -31,6 +31,8 @@ load-bearing execution behavior.
   separately governed future AI-assisted capabilities.
 - [Delivery plan](delivery-plan.md): implementation sequence and acceptance
   criteria for the fused ISRP application.
+- [Definition of done](../definition-of-done.md): change, delivery, and
+  release quality gates for the fused ISRP codebase.
 
 ## Core decisions
 

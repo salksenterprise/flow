@@ -2,9 +2,9 @@
 
 > **Historical.** This records what the Releases 1-3 delivery contained, when
 > Flow was a standalone service. Several behaviours described here have since
-> changed and the architecture has moved to an embeddable core. For the current
-> state see [the charter](charter.md), [the requirements](requirements.md) and
-> [the technical design](technical-design.md).
+> changed, and the standalone and embedded-engine approaches were both retired
+> when orchestration was fused into ISRP. For the current design, see the
+> [ISRP design set](isrp/README.md) and [ISRP orchestration](isrp/orchestration.md).
 
 
 ## Scope
