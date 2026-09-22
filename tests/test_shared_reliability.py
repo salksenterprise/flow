@@ -1,9 +1,7 @@
-"""One event log, one outbox, one inbox, shared by Flow and its host.
+"""One event log, one outbox, and one inbox for the fused ISRP application.
 
-An embedding host has no reason to stand up a parallel set of reliability
-tables beside Flow's. These tests hold the shared surface to the same standard
-as Flow's own: ordered per aggregate, paired with an outbox row, and inside the
-host's transaction.
+Domain and orchestration changes use the same ordered aggregate stream, paired
+outbox rows, and application transaction.
 """
 
 from __future__ import annotations
@@ -18,6 +16,8 @@ from pathlib import Path
 from isrp.orchestration import ValidationError, WorkflowEngine
 from isrp.orchestration.schema import SCHEMA_VERSION
 from isrp.orchestration import SQLiteWorkflowRepository
+
+from support import owner
 
 
 def command(**values):
@@ -54,7 +54,7 @@ class SharedLogTests(unittest.TestCase):
         with self.repository.transaction():
             return self.repository.db.execute(sql, args).fetchall()
 
-    # The host's events share Flow's log.
+    # Domain and execution events share one log.
 
     def test_host_domain_event_lands_in_the_shared_log(self):
         recorded = self.engine.record_event(
@@ -82,7 +82,7 @@ class SharedLogTests(unittest.TestCase):
                  for item in self.engine.list_events("ISRP_ASSESSMENT", "ASMT-1")]
         second = [item["sequence_number"]
                   for item in self.engine.list_events("ISRP_ASSESSMENT", "ASMT-2")]
-        workflow_events = self.engine.list_events("WORKFLOW", workflow["id"])
+        workflow_events = self.engine.list_events(*owner(workflow))
 
         self.assertEqual(first, [1, 2, 3])
         self.assertEqual(second, [1])
@@ -125,7 +125,7 @@ class SharedLogTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.engine.record_event("ISRP_REQUEST", "ISR-1", "X", nonsense=True)
 
-    # The point of sharing: one transaction over both.
+    # The point of fusion: one transaction over both.
 
     def test_a_domain_event_and_a_workflow_transition_roll_back_together(self):
         workflow = self.start()
@@ -170,7 +170,7 @@ class SharedLogTests(unittest.TestCase):
         self.assertEqual(len(claimed), 1)
         self.assertEqual(claimed[0]["claimed_by"], "connector-runner")
 
-        self.engine.complete_inbox_event(claimed[0]["id"])
+        self.engine.complete_inbox_event(claimed[0]["id"], "connector-runner")
         self.assertEqual(self.engine.claim_inbox_events("connector-runner"), [])
         self.assertEqual(
             self.rows("SELECT status FROM inbox_event WHERE id=?", claimed[0]["id"])[0][0],

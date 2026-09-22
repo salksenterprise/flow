@@ -1,9 +1,8 @@
 """Who is asking.
 
-Embedded, this comes from host code that has already authenticated the caller,
-so it arrives as a value rather than as parseable text. Flow never reads a
-credential, a token or a header: it is handed an identity and trusts the caller
-to have established it.
+The ISRP application authenticates the caller before invoking orchestration.
+Orchestration never reads a credential, token, or transport header; it receives
+an established identity value.
 """
 
 from __future__ import annotations
@@ -25,9 +24,8 @@ class Actor:
     def from_value(cls, value: Any) -> "Actor":
         """Accepts an Actor, a mapping, a bare string, or nothing.
 
-        The string and mapping forms exist because commands arrive as plain
-        data over HTTP and from older callers. Whatever the shape, it becomes
-        one type before the engine sees it.
+        The string and mapping forms support plain command data and older
+        callers. Whatever the shape, it becomes one type before execution.
         """
         if isinstance(value, Actor):
             return value

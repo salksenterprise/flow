@@ -70,13 +70,37 @@ DEFAULT_STEP_FSM = {
 }
 
 
+def timestamp(moment: datetime) -> str:
+    """Canonical sortable UTC timestamp, matching the SQL default exactly."""
+    return moment.astimezone(timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
 def utcnow() -> str:
-    """One timestamp format, matching the SQL default exactly.
+    """The current time in the one persisted timestamp format.
 
     Mixing isoformat() with SQLite's CURRENT_TIMESTAMP produced two shapes in
     the same column, and due_at comparisons are string comparisons.
     """
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return timestamp(datetime.now(timezone.utc))
+
+
+def bounded_limit(limit: int, maximum: int = 1000) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
+        raise ValidationError(f"limit must be between 1 and {maximum}")
+    return limit
+
+
+def valid_offset(offset: int) -> int:
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValidationError("offset must be zero or greater")
+    return offset
+
+
+def valid_worker_id(worker_id: str) -> str:
+    if not isinstance(worker_id, str) or not worker_id.strip():
+        raise ValidationError("worker_id must be a non-empty string")
+    return worker_id
 
 
 # Every object this schema owns. Test isolation and the odd shared database
@@ -136,7 +160,7 @@ def apply_prefix(sql: str, prefix: str) -> str:
 
 
 class _PrefixedConnection:
-    """Rewrites Flow's object names on the way to the database.
+    """Rewrites orchestration object names on the way to the database.
 
     One choke point rather than a template in each of the hundred-odd inline
     statements, and it works for a connection the host owns as readily as one
@@ -187,6 +211,10 @@ class SQLiteWorkflowRepository:
         transition commit as one unit. A table_prefix namespaces the tables,
         which is how the tests keep runs apart.
         """
+        if table_prefix and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_prefix):
+            raise ValidationError(
+                "table_prefix must contain only letters, numbers, and underscores "
+                "and must not start with a number")
         self.path = str(path) if path is not None else None
         self.table_prefix = table_prefix
         self._local = threading.local()
@@ -207,8 +235,8 @@ class SQLiteWorkflowRepository:
     def _connect(self) -> sqlite3.Connection:
         if self.path is None:
             raise RuntimeError(
-                "This repository is embedded and has no database path. The host "
-                "must bind its own connection: `with repository.using(connection):`"
+                "This repository is connection-bound and has no database path. "
+                "ISRP must bind its connection: `with repository.using(connection):`"
             )
         connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
         connection.row_factory = sqlite3.Row
@@ -245,6 +273,11 @@ class SQLiteWorkflowRepository:
                 "create_schema cannot run inside an open transaction: DDL commits "
                 "implicitly and would commit the caller's uncommitted work with it"
             )
+        existing_version = self._existing_schema_version(connection)
+        if existing_version is not None and existing_version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema version {existing_version} is newer than this "
+                f"runtime's version {SCHEMA_VERSION}")
         wrapped = self._wrap(connection)
         legacy = self._legacy_database(connection)
         wrapped.executescript(SCHEMA)
@@ -259,9 +292,15 @@ class SQLiteWorkflowRepository:
             connection.execute("PRAGMA foreign_keys=OFF")
         try:
             with self.using(connection):
+                version = self._schema_version()
+                # The built-in FSM rows written below include the v4 category
+                # column, so a stamped v3 database must receive that structural
+                # migration before those rows can be ensured.
+                if version is not None and version < 4:
+                    self._migrate_to_4_state_category()
+                    version = 4
                 lifecycle_id = self._ensure_fsm(DEFAULT_LIFECYCLE_FSM, "WORKFLOW")
                 step_id = self._ensure_fsm(DEFAULT_STEP_FSM, "STEP")
-                version = self._schema_version()
                 if version is None:
                     # A fresh database is already at the current shape. Only a
                     # populated one that predates stamping needs the 0.2
@@ -309,8 +348,28 @@ class SQLiteWorkflowRepository:
         return (f"{prefix}workflow_instance" in tables
                 and f"{prefix}schema_metadata" not in tables)
 
+    def _existing_schema_version(self, connection: sqlite3.Connection) -> int | None:
+        table = f"{self.table_prefix}schema_metadata"
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not exists:
+            return None
+        row = connection.execute(
+            f'SELECT value FROM "{table}" WHERE key=?', ("schema_version",)
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def _migrate_to_4_state_category(self) -> None:
+        """Complete the v3-to-v4 step that introduced explicit state categories."""
+        columns = {row["name"] for row in self.db.execute(
+            "PRAGMA table_info(fsm_state_definition)")}
+        if columns and "category" not in columns:
+            self.db.execute(
+                "ALTER TABLE fsm_state_definition ADD COLUMN category TEXT")
+
     def _migrate_to_5_shared_event_log(self) -> None:
-        """One event log, one outbox and one inbox for the host and for Flow.
+        """One event log, one outbox, and one inbox for all ISRP modules.
 
         The outbox and inbox gain columns. The event log cannot: its workflow
         column was NOT NULL and its uniqueness was per workflow, neither of
@@ -481,6 +540,13 @@ class SQLiteWorkflowRepository:
         self.db.execute("DROP TABLE IF EXISTS workflow_subject")
         if folding:
             self.db.execute("DROP TABLE workflow_instance")
+
+    def _migrate_to_8_command_fingerprint(self) -> None:
+        columns = {row["name"] for row in self.db.execute(
+            "PRAGMA table_info(workflow_command)")}
+        if "request_fingerprint" not in columns:
+            self.db.execute(
+                "ALTER TABLE workflow_command ADD COLUMN request_fingerprint TEXT")
 
     def _fold_workflow_instance(self, roots: str) -> None:
         self.db.execute(
@@ -794,17 +860,20 @@ class SQLiteWorkflowRepository:
         square of the number of commands.
         """
         row = self.db.execute(
-            """SELECT owner_type,owner_id,action,revision FROM workflow_command
+            """SELECT owner_type,owner_id,action,revision,request_fingerprint
+               FROM workflow_command
                WHERE command_id=?""", (command_id,)).fetchone()
         return dict(row) if row else None
 
     def record_command(self, command_id: str, owner: Any, action: str,
-                       revision: int | None = None) -> None:
+                       revision: int | None = None,
+                       request_fingerprint: str | None = None) -> None:
         owner = as_owner(owner)
         self.db.execute(
-            """INSERT INTO workflow_command(command_id,owner_type,owner_id,action,revision)
-               VALUES (?,?,?,?,?)""",
-            (command_id, owner.type, owner.id, action, revision))
+            """INSERT INTO workflow_command
+               (command_id,owner_type,owner_id,action,revision,request_fingerprint)
+               VALUES (?,?,?,?,?,?)""",
+            (command_id, owner.type, owner.id, action, revision, request_fingerprint))
 
     def create_aggregate(self, owner_type: str, data: dict[str, Any],
                          version: dict[str, Any]) -> Owner:
@@ -864,7 +933,7 @@ class SQLiteWorkflowRepository:
         """
         owner = as_owner(owner)
         current = {row["step_key"]: dict(row) for row in self.db.execute(
-            """SELECT si.id,si.execution_status,sd.step_key
+            """SELECT si.id,si.state,si.execution_status,sd.step_key
                FROM step_instance si JOIN step_definition sd ON sd.id=si.step_definition_id
                WHERE si.owner_type=? AND si.owner_id=?""", (owner.type, owner.id))}
         target = {row["step_key"]: dict(row) for row in self.db.execute(
@@ -875,6 +944,10 @@ class SQLiteWorkflowRepository:
         placeholders = ",".join("?" * len(TERMINAL_STEP_EXECUTION))
         for key, row in current.items():
             if key in target:
+                if not self.fsm_has_state(target[key]["step_fsm_version_id"], row["state"]):
+                    raise ConflictError(
+                        f"Target step '{key}' FSM does not contain current state "
+                        f"'{row['state']}'")
                 self.db.execute(
                     "UPDATE step_instance SET step_definition_id=? WHERE id=?",
                     (target[key]["id"], row["id"]))
@@ -1107,13 +1180,19 @@ class SQLiteWorkflowRepository:
              data.get("correlation_key"), json.dumps(data.get("payload", {}))),
         ).lastrowid
 
-    def mark_inbox_processed(self, inbox_id: int, error: str | None = None) -> None:
-        self.db.execute(
+    def mark_inbox_processed(self, inbox_id: int, error: str | None = None,
+                             worker_id: str | None = None) -> bool:
+        claimant = " AND status='PROCESSING' AND claimed_by=?" if worker_id else ""
+        args = ["PROCESSED" if error is None else "FAILED", error, error, inbox_id]
+        if worker_id:
+            args.append(worker_id)
+        changed = self.db.execute(
             """UPDATE inbox_event SET status=?,attempts=attempts+1,
                processed_at=CASE WHEN ? IS NULL THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE processed_at END,
-               last_error=? WHERE id=?""",
-            ("PROCESSED" if error is None else "FAILED", error, error, inbox_id),
+               last_error=?,claimed_by=NULL,claimed_at=NULL WHERE id=?""" + claimant,
+            args,
         )
+        return changed.rowcount == 1
 
     def unconsumed_signal(self, owner: Any, signal_type: str,
                           correlation_key: str | None) -> dict[str, Any] | None:
@@ -1144,7 +1223,12 @@ class SQLiteWorkflowRepository:
         )
 
     def claim_jobs(self, worker_id: str, limit: int = 10, lease_seconds: int = 60) -> list[dict[str, Any]]:
-        now, lease = utcnow(), (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
+        valid_worker_id(worker_id)
+        bounded_limit(limit)
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds <= 0:
+            raise ValidationError("lease_seconds must be a positive whole number")
+        now = utcnow()
+        lease = timestamp(datetime.now(timezone.utc) + timedelta(seconds=lease_seconds))
         rows = list(self.db.execute(
             f"""SELECT j.id FROM automation_job j
                 WHERE {running_owner_sql('j')} AND (
@@ -1212,6 +1296,7 @@ class SQLiteWorkflowRepository:
         they fire once it resumes, rather than advancing something that is
         meant to be idle.
         """
+        bounded_limit(limit)
         return [decode(row) for row in self.db.execute(
             f"""SELECT t.* FROM durable_timer t
                 WHERE t.status='SCHEDULED' AND t.due_at<=? AND {running_owner_sql('t')}
@@ -1379,6 +1464,8 @@ class SQLiteWorkflowRepository:
 
     def list_events(self, aggregate_type: str, aggregate_id: str,
                     limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
+        bounded_limit(limit)
+        valid_offset(offset)
         with self.transaction():
             return [decode(row) for row in self.db.execute(
                 """SELECT * FROM event_log WHERE aggregate_type=? AND aggregate_id=?
@@ -1408,18 +1495,25 @@ class SQLiteWorkflowRepository:
             "duplicate": False}
 
     def claim_inbox_events(self, worker_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        """Claim received provider events for processing, guarded like jobs."""
+        """Lease provider events so only one worker can process each receipt."""
+        valid_worker_id(worker_id)
+        bounded_limit(limit)
         with self.transaction():
             now = utcnow()
+            stale = timestamp(datetime.now(timezone.utc) - timedelta(minutes=5))
             rows = list(self.db.execute(
                 """SELECT id FROM inbox_event
-                   WHERE status='RECEIVED' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-                   ORDER BY id LIMIT ?""", (now, limit)))
+                   WHERE (status='RECEIVED' AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+                      OR (status='PROCESSING' AND claimed_at<?)
+                   ORDER BY id LIMIT ?""", (now, stale, limit)))
             claimed = []
             for row in rows:
                 changed = self.db.execute(
-                    """UPDATE inbox_event SET claimed_by=?,claimed_at=?
-                       WHERE id=? AND status='RECEIVED'""", (worker_id, now, row["id"]))
+                    """UPDATE inbox_event SET status='PROCESSING',claimed_by=?,claimed_at=?
+                       WHERE id=? AND ((status='RECEIVED' AND
+                           (next_attempt_at IS NULL OR next_attempt_at<=?))
+                           OR (status='PROCESSING' AND claimed_at<?))""",
+                    (worker_id, now, row["id"], now, stale))
                 if changed.rowcount == 1:
                     claimed.append(decode(self.db.execute(
                         "SELECT * FROM inbox_event WHERE id=?", (row["id"],)).fetchone()))
@@ -1438,6 +1532,8 @@ class SQLiteWorkflowRepository:
         rules instead, answering 'what could this person claim' rather than
         'what is already theirs'.
         """
+        bounded_limit(limit)
+        valid_offset(offset)
         clauses = ["si.execution_status IN ('READY','ACTIVE','WAITING')"]
         args: list[Any] = []
         if assignee:
@@ -1501,6 +1597,7 @@ class SQLiteWorkflowRepository:
         the system will say so. The limit is applied per owner type and then to
         the combined result, so a flood of one kind cannot hide the other.
         """
+        bounded_limit(limit)
         with self.transaction():
             found: list[dict[str, Any]] = []
             for owner_type, table in OWNER_TABLES.items():
@@ -1521,6 +1618,7 @@ class SQLiteWorkflowRepository:
             return found[:limit]
 
     def dead_letter_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        bounded_limit(limit)
         with self.transaction():
             return [decode(row) for row in self.db.execute(
                 """SELECT id,event_id,event_type,attempts,max_attempts,last_error,created_at
@@ -1613,9 +1711,11 @@ class SQLiteWorkflowRepository:
             )}
 
     def pending_outbox(self, limit: int = 50, worker_id: str = "delivery-worker") -> list[dict[str, Any]]:
+        valid_worker_id(worker_id)
+        bounded_limit(limit)
         with self.transaction():
             now = utcnow()
-            stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+            stale = timestamp(datetime.now(timezone.utc) - timedelta(minutes=5))
             rows = list(self.db.execute(
                 """SELECT id FROM outbox_event WHERE
                    (status='PENDING' AND next_attempt_at<=?)
@@ -1671,7 +1771,7 @@ class SQLiteWorkflowRepository:
                 )
             else:
                 delay = min(3600, 2 ** min(attempts, 10))
-                next_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+                next_at = timestamp(datetime.now(timezone.utc) + timedelta(seconds=delay))
                 self.db.execute(
                     """UPDATE outbox_event SET status='PENDING',attempts=?,last_error=?,next_attempt_at=?,
                        claimed_by=NULL,claimed_at=NULL WHERE id=?""",

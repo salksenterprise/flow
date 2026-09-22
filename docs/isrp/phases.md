@@ -20,12 +20,10 @@ Future:
   AI_AUTOMATED_SUPERVISED
 ~~~
 
-Flow has no execution-mode concept: it knows node types, not who or what
-performs the work. Execution mode is an ISRP field, and ISRP validates its own
-templates before importing them, because Flow's publication validation cannot
-reject a mode it does not model. AI is introduced only through separately
-published future workflow versions. See the open dependencies in
-[Architecture](architecture.md).
+Execution mode is part of each performed step definition. Current publication
+validation accepts HUMAN and AUTOMATION, rejects the two reserved AI modes, and
+rejects unknown values. AI can be introduced only through separately published
+future workflow versions and the governance described below.
 
 ## Capability summary
 
@@ -54,7 +52,7 @@ published future workflow versions. See the open dependencies in
 | AI missing-evidence suggestions | No | Yes |
 | AI potential-finding proposals | No | Yes |
 
-## Current deterministic flow
+## Current deterministic process
 
 ~~~text
 Human intake
@@ -118,7 +116,7 @@ Current automation does not:
 
 OCR or other document technology that uses model-based inference requires explicit approval. The default current scope is native-text extraction and manual handling for unsupported scans.
 
-## Current evidence flow
+## Current evidence process
 
 Evidence may be uploaded at request, assessment, or subject level. A human connects an exact immutable evidence version to a requirement through a citation.
 
@@ -219,7 +217,7 @@ Implement now:
 - metadata proposals from RULE or INTEGRATION
 - audit, outbox, processed-event, and RDBMS status projections
 
-## Future AI-assisted flow
+## Future AI-assisted process
 
 ~~~text
 Deterministic evidence processing

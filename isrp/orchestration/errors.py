@@ -1,4 +1,4 @@
-"""Flow's error types.
+"""ISRP orchestration error types.
 
 Anything arising from workflow data or workflow state raises a WorkflowError,
 so an embedding host can catch one type and roll its transaction back.

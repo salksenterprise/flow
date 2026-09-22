@@ -3,8 +3,7 @@
 ## Purpose and authority
 
 This is the single canonical logical data model for the Information Security
-Review Process (ISRP) and its integration with the embedded generic Flow
-workflow core.
+Review Process (ISRP), including its fused orchestration records.
 
 Other ISRP documents describe behavior, workflow, delivery phases, or visual examples. When an entity name, relationship, field, or constraint differs, this document is authoritative.
 
@@ -13,7 +12,7 @@ The model covers:
 - requests and assessments
 - applications, technologies, vendors, products, and other subjects
 - duplicate and overlap detection
-- generic Flow references
+- orchestration definitions and runtime records
 - lifecycle state and transition history
 - security domains, requirements, versions, and requirement sets
 - assessment requirement snapshots
@@ -82,9 +81,9 @@ Large evidence files live in controlled object/document storage. The RDBMS store
 - Use separate adapters for JSON operators, locking, outbox claiming, and migrations.
 - Use explicit bridge tables instead of unconstrained entity_type/entity_id associations where referential integrity matters.
 
-## Ownership boundaries
+## Module ownership
 
-### ISRP host application owns
+### ISRP domain modules own
 
 - requests and assessments
 - subjects and scope
@@ -95,24 +94,24 @@ Large evidence files live in controlled object/document storage. The RDBMS store
 - assertions, determinations, and decisions
 - findings, remediation cases, CAPs, external issue references, and exceptions
 - lifecycle transition history
-- audit and business outbox events
+- domain audit events and outbound messages
 - request and assessment status projections
 
-### Embedded Flow core logically owns
+### ISRP orchestration modules own
 
 - workflow definitions and immutable versions
 - DAG node and edge definitions
 - FSM definitions and transitions
-- workflow and step instances
+- request/assessment orchestration state and step instances
 - work items and assignment mechanics
 - timers, retries, and execution transitions
-- Flow audit and Flow outbox events
+- execution events and their outbound messages
 
-ISRP and Flow share the host database but retain separate logical ownership.
-Stable bindings such as request-to-workflow, assessment-to-workflow, and work
-package-to-step may use database-enforced foreign keys. Flow does not traverse
-those relationships to interpret ISRP records; business keys, facts, signals,
-and event payloads remain opaque to the engine.
+These are modules within one ISRP application, not separately deployed or
+versioned products. They share one transaction, ordered event log, outbox, and
+inbox. Stable relationships use database-enforced foreign keys. Orchestration
+does not interpret the security meaning of requirements, evidence, findings,
+or decisions.
 
 ## High-level relationship view
 
@@ -551,7 +550,7 @@ it to keep two runs apart in one file. A separate database schema is not an
 option, because on SQLite a schema-qualified name cannot appear in a foreign
 key reference.
 
-## Flow definition tables
+## Orchestration definition tables
 
 ~~~text
 workflow_definition        workflow_version
@@ -888,7 +887,7 @@ REQUIRED_FLAG_CHANGED
 
 ## REQUIREMENT_WORK_PACKAGE
 
-A distribution unit linked to a Flow step.
+A distribution unit linked to an orchestration step.
 
 ~~~text
 work_package_id
@@ -1842,15 +1841,15 @@ apply_command_id
 
 # Part XII: Audit, idempotency, and integration events
 
-ISRP does not define its own audit table, outbox or inbox. Embedded, it shares
-Flow's, writing through the engine into the same tables in the same transaction.
-One ordered log, one delivery mechanism, one connector receipt store.
+ISRP has one event log, one outbox, and one inbox. Domain and orchestration
+modules write the same tables in the same transaction: one ordering, one
+delivery mechanism, and one connector receipt store.
 
 An earlier revision of this document defined AUDIT_EVENT, OUTBOX_EVENT and
-INTEGRATION_INBOX_EVENT as ISRP-owned tables. Under the embedded architecture
-that produced two of everything: two orderings that could not be reconciled, two
-delivery workers, two dead-letter surfaces, and a direct name collision on
-`outbox_event`. Those entities are replaced by the shared ones below.
+INTEGRATION_INBOX_EVENT beside the workflow component's equivalent tables. That
+produced two of everything: two irreconcilable orderings, two delivery workers,
+two dead-letter surfaces, and a direct name collision on `outbox_event`. The
+fused model has only the records below.
 
 ## EVENT_LOG
 
@@ -1883,11 +1882,11 @@ created_at
 
 Constraint: `UNIQUE(aggregate_type, aggregate_id, sequence_number)`.
 
-ISRP writes through the engine, never with its own SQL, because sequence
-allocation and the event-to-outbox pairing must not be reimplemented:
+ISRP writes through the orchestration API, never with ad hoc SQL, because
+sequence allocation and event-to-outbox pairing must not be reimplemented:
 
 ~~~python
-engine.record_event(
+orchestration.record_event(
     "ISRP_ASSESSMENT", assessment_id, "REVIEWER_DETERMINATION_RECORDED",
     actor=current_actor, correlation_id=request_number,
     previous_revision=before, new_revision=after,
@@ -1896,8 +1895,8 @@ engine.record_event(
 )
 ~~~
 
-`WORKFLOW` is reserved for Flow. ISRP passing it is refused, which is what keeps
-the two sequences from interfering.
+Execution events use the same `ISRP_REQUEST` or `ISRP_ASSESSMENT` aggregate as
+the domain change they accompany. There is no reserved `WORKFLOW` aggregate.
 
 Important ISRP event types:
 
@@ -1922,10 +1921,10 @@ FINDING_VALIDATED
 An event explains who performed an action. It is not a substitute for the
 immutable business records in Parts VI to X.
 
-## OUTBOX_EVENT (shared with Flow)
+## OUTBOX_EVENT
 
-Flow's table. `record_event` writes the outbox row in the same statement as the
-log row, so an ISRP event can never be recorded without its outbound copy. Pass
+`record_event` writes the outbox row with the log row in the same transaction,
+so a publishable event cannot be recorded without its outbound copy. Pass
 `publish=False` for an audit-only event that no consumer should receive.
 
 ~~~text
@@ -1951,17 +1950,19 @@ Constraint: `UNIQUE(event_id)`.
 
 ISRP previously specified
 `UNIQUE(aggregate_type, aggregate_id, aggregate_version, event_type)` for
-emit-once. That constraint cannot hold for Flow's rows, because a single graph
-advance emits several events at one revision. ISRP obtains the identical
-guarantee by deriving `event_id` deterministically from
-`(aggregate_type, aggregate_id, aggregate_version, event_type)` and letting
-`UNIQUE(event_id)` reject the second write.
+emit-once. That constraint cannot hold for execution rows, because a graph
+advance may emit several events at one revision. Execution commands rely on
+their command receipt to prevent duplicate effects. Domain callers that may be
+retried supply a stable `event_id`; `UNIQUE(event_id)` rejects the second write.
+When no stable identifier is supplied, `record_event` generates a UUID and the
+caller is explicitly choosing append-only rather than retry-deduplicated
+semantics.
 
-## INBOX_EVENT (shared with Flow)
+## INBOX_EVENT
 
-Flow's table. ISRP records issue-management receipts through
-`engine.record_inbox_event`, which does not require a workflow, so a provider
-event can be accepted before it is correlated to one.
+ISRP records issue-management receipts through `record_inbox_event`, which does
+not require an aggregate, so a provider event can be accepted before it is
+correlated.
 
 ~~~text
 connector_name
@@ -1970,7 +1971,7 @@ event_type
 correlation_key
 correlation_id
 payload_json
-status                    RECEIVED | PROCESSED | FAILED
+status                    RECEIVED | PROCESSING | PROCESSED | FAILED
 attempts
 received_at
 next_attempt_at
@@ -1982,17 +1983,18 @@ last_error
 
 Constraint: `UNIQUE(connector_name, provider_event_id)`.
 
-`engine.claim_inbox_events` and `engine.complete_inbox_event` drive one
-connector runner for ISRP receipts and Flow signals alike. Where an ISRP receipt
-should also advance a workflow, ISRP calls `ingest_external_event` for that
-workflow, which translates it into a signal through the same idempotent command
-path.
+`claim_inbox_events` leases a receipt to one connector runner, with stale-lease
+recovery. `complete_inbox_event` records success or failure. Where a receipt
+must also advance an aggregate, `ingest_external_event` translates it into a
+signal through the same idempotent command path.
 
 ## ISRP_COMMAND and command idempotency
 
-A receipt of `{owner_type, owner_id, action, revision}` is stored per
-`command_id`, in columns rather than as a serialized response. A repeated
-command has one effect and returns the aggregate's current state.
+A receipt of `{owner_type, owner_id, action, revision, request_fingerprint}` is
+stored per `command_id`, in columns rather than as a serialized response. The
+fingerprint binds the identifier to its operation, target, and semantic
+payload. An exact retry has one effect and returns current state; reuse with
+different parameters is a conflict.
 
 ISRP commands that do not reach the orchestration need their own deduplication. Where
 one is needed, ISRP keeps a table of its own:
@@ -2010,8 +2012,8 @@ result_reference
 status
 ~~~
 
-This is deliberately not shared. Flow's receipt is scoped to a workflow and
-carries a workflow revision, which an ISRP-only command does not have.
+This table is for domain commands that never enter orchestration and therefore
+cannot use an orchestration command receipt.
 
 ## PROCESSED_EVENT
 
@@ -2027,8 +2029,8 @@ source_version
 
 Constraint: `PRIMARY KEY(consumer_name, event_id)`
 
-Because the log is shared, one projector can consume ISRP and Flow events from
-a single stream and record both here.
+One projector can consume domain and execution events from the ordered log and
+record both here.
 
 # Part XIII: RDBMS status projections
 
@@ -2303,8 +2305,8 @@ Future AI proposals are applied only through deterministic authorized commands. 
 
 # Part XVI: Core transaction invariants
 
-Every sequence below runs in one host-owned transaction covering ISRP records,
-embedded Flow records and the shared log.
+Every sequence below runs in one application-owned transaction covering domain
+records, orchestration records, and the ordered log.
 
 `record_event` writes the event-log row and its outbox row in one call, so the
 older "insert AUDIT_EVENT, insert OUTBOX_EVENT" pair is now a single step and an
@@ -2500,7 +2502,7 @@ PROPOSAL_DECISION
 ISRP_COMMAND
 PROCESSED_EVENT
 
-created by Flow's migration, written by both:
+created by ISRP migrations and written by domain and orchestration modules:
 EVENT_LOG
 OUTBOX_EVENT
 INBOX_EVENT
@@ -2510,7 +2512,7 @@ ASSESSMENT_STATUS_PROJECTION
 ASSESSMENT_ACTIVE_PHASE
 ~~~
 
-Flow definition and runtime entities remain logically owned by the embedded
-generic Flow package even though they share the ISRP process, database, and
-transaction. ISRP code references Flow through its public engine and repository
-contracts rather than writing Flow-owned tables directly.
+Definition and runtime entities are owned by the ISRP orchestration module.
+Other domain modules call its public API rather than modifying orchestration
+tables directly. The repository contract remains only to keep SQLite and the
+future Oracle adapter behaviorally equivalent.

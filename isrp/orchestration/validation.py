@@ -16,9 +16,17 @@ STEP_TYPES = {
     "ASSESSMENT", "WAIT_SIGNAL", "TIMER", "MILESTONE", "END",
 }
 JOIN_RULES = {"ALL", "ANY", "N_OF_M", "ALL_REQUIRED"}
+CANDIDATE_TYPES = {"USER", "ROLE", "GROUP", "ORGANIZATION"}
 
 
 def validate_fsm(spec: dict[str, Any], label: str) -> None:
+    if not isinstance(spec, dict):
+        raise ValidationError(f"{label} must be an object")
+    if not spec.get("key"):
+        raise ValidationError(f"{label} needs a key")
+    version = spec.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+        raise ValidationError(f"{label} version must be a positive whole number")
     states = [item if isinstance(item, str) else item.get("key") for item in spec.get("states", [])]
     if not states or None in states or len(states) != len(set(states)):
         raise ValidationError(f"{label} states must be present and unique")
@@ -44,12 +52,23 @@ def validate_fsm(spec: dict[str, Any], label: str) -> None:
 
 
 def validate_template(template: dict[str, Any]) -> None:
+    if not isinstance(template, dict):
+        raise ValidationError("A workflow definition must be an object")
     steps = template.get("steps", [])
     transitions = template.get("transitions", [])
-    if not steps:
+    if not template.get("key") or not template.get("name"):
+        raise ValidationError("A workflow needs a key and name")
+    version = template.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+        raise ValidationError("Workflow version must be a positive whole number")
+    if not isinstance(steps, list) or not steps:
         raise ValidationError("A workflow needs at least one step")
+    if not isinstance(transitions, list):
+        raise ValidationError("Workflow transitions must be a list")
     if template.get("lifecycle_fsm"):
         validate_fsm(template["lifecycle_fsm"], "Lifecycle FSM")
+    if any(not isinstance(step, dict) for step in steps):
+        raise ValidationError("Every workflow step must be an object")
     keys = [step.get("key") for step in steps]
     if None in keys or len(keys) != len(set(keys)):
         raise ValidationError("Step keys must be present and unique")
@@ -60,14 +79,29 @@ def validate_template(template: dict[str, Any]) -> None:
     reverse: dict[str, list[str]] = {key: [] for key in keys}
     by_key = {step["key"]: step for step in steps}
     for step in steps:
+        if not step.get("name"):
+            raise ValidationError(f"Step '{step['key']}' needs a name")
+        if not isinstance(step.get("configuration", {}), dict):
+            raise ValidationError(f"Step '{step['key']}' configuration must be an object")
         if step.get("type") not in STEP_TYPES:
             raise ValidationError(f"Unsupported step type: {step.get('type')}")
         if step.get("type") == "JOIN" and step.get("join_rule") not in JOIN_RULES:
             raise ValidationError(f"JOIN step '{step['key']}' requires a supported join_rule")
+        if step.get("type") == "JOIN" and step.get("join_rule") == "N_OF_M":
+            required = step.get("configuration", {}).get("required_count")
+            if (isinstance(required, bool) or not isinstance(required, int)
+                    or required <= 0):
+                raise ValidationError(
+                    f"JOIN step '{step['key']}' with N_OF_M requires a positive "
+                    "configuration.required_count")
         if step.get("type") == "WAIT_SIGNAL" and not step.get("configuration", {}).get("signal_type"):
             raise ValidationError(f"WAIT_SIGNAL step '{step['key']}' requires configuration.signal_type")
-        if step.get("type") == "TIMER" and "delay_seconds" not in step.get("configuration", {}):
-            raise ValidationError(f"TIMER step '{step['key']}' requires configuration.delay_seconds")
+        if step.get("type") == "TIMER":
+            delay = step.get("configuration", {}).get("delay_seconds")
+            if (isinstance(delay, bool) or not isinstance(delay, int) or delay < 0):
+                raise ValidationError(
+                    f"TIMER step '{step['key']}' requires a non-negative whole-number "
+                    "configuration.delay_seconds")
         if step.get("fsm"):
             validate_fsm(step["fsm"], f"Step FSM '{step['key']}'")
         mode = step.get("execution_mode")
@@ -96,6 +130,20 @@ def validate_template(template: dict[str, Any]) -> None:
             raise ValidationError(
                 f"ASSESSMENT step '{step['key']}' requires "
                 "configuration.assessment_workflow_version_id")
+        if step.get("type") == "ASSESSMENT":
+            child_version = configuration["assessment_workflow_version_id"]
+            if (isinstance(child_version, bool) or not isinstance(child_version, int)
+                    or child_version <= 0):
+                raise ValidationError(
+                    f"ASSESSMENT step '{step['key']}' assessment_workflow_version_id "
+                    "must be a positive whole number")
+        if step.get("type") == "AUTOMATED_TASK":
+            attempts = configuration.get("max_attempts", 3)
+            if (isinstance(attempts, bool) or not isinstance(attempts, int)
+                    or attempts <= 0):
+                raise ValidationError(
+                    f"AUTOMATED_TASK step '{step['key']}' max_attempts must be a "
+                    "positive whole number")
         assessment_policy = configuration.get("assessment_failure_policy")
         if assessment_policy is not None and assessment_policy not in ASSESSMENT_FAILURE_POLICIES:
             raise ValidationError(
@@ -119,8 +167,15 @@ def validate_template(template: dict[str, Any]) -> None:
             if not candidate.get("type") or not candidate.get("value"):
                 raise ValidationError(
                     f"Step '{step['key']}' has a candidate without a type and value")
+            if candidate["type"] not in CANDIDATE_TYPES:
+                raise ValidationError(
+                    f"Step '{step['key']}' has unsupported candidate type "
+                    f"'{candidate['type']}'. Supported: "
+                    f"{', '.join(sorted(CANDIDATE_TYPES))}")
     edge_keys: set[tuple[str, str]] = set()
     for edge in transitions:
+        if not isinstance(edge, dict):
+            raise ValidationError("Every workflow transition must be an object")
         source, destination = edge.get("from_step"), edge.get("to_step")
         if source not in known or destination not in known:
             raise ValidationError(f"Unknown transition endpoint: {source} -> {destination}")
@@ -143,6 +198,12 @@ def validate_template(template: dict[str, Any]) -> None:
     for step in steps:
         if step["type"] != "END" and outgoing[step["key"]] == 0:
             raise ValidationError(f"Non-END step '{step['key']}' has no outgoing transition")
+        if step["type"] == "JOIN" and step.get("join_rule") == "N_OF_M":
+            required = step.get("configuration", {})["required_count"]
+            if required > incoming[step["key"]]:
+                raise ValidationError(
+                    f"JOIN step '{step['key']}' requires {required} predecessors but "
+                    f"only {incoming[step['key']]} feed it")
     color: dict[str, int] = {key: 0 for key in keys}
 
     def visit(key: str) -> None:

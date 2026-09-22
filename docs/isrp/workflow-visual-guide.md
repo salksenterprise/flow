@@ -185,7 +185,8 @@ Categorization
           Request Join
 ~~~
 
-The request DAG can create one or more assessment workflow instances.
+The request DAG can create one or more assessment records. Each assessment is
+its own orchestration aggregate; no separate workflow instance is created.
 
 ## Request FSM and DAG together
 
@@ -782,7 +783,7 @@ ISSUE_REFERENCE
 Later provider event
         | <------------------------------------- Status = RESOLVED
         v
-Shared INBOX_EVENT
+ISRP INBOX_EVENT
 (deduplicate and correlate)
         |
         v
@@ -805,27 +806,18 @@ External RESOLVED means "ready for ISRP validation," not "finding closed."
 
 ~~~text
 ISRP_REQUEST
-    |
-    | request_id
+    +----< STEP_INSTANCE (owner_type = ISRP_REQUEST)
+    |         |
+    |         +---- Step FSM state
     |
     +----< ISRP_ASSESSMENT
-              |
-              | assessment_id
-              |
-              +----< WORKFLOW_INSTANCE
+              +----< STEP_INSTANCE (owner_type = ISRP_ASSESSMENT)
               |         |
-              |         +----< STEP_INSTANCE
-              |                    |
-              |                    +---- Step FSM state
-              |
+              |         +---- Step FSM state
               +----< ASSESSMENT_REQUIREMENT
-              |
               +----< REQUIREMENT_WORK_PACKAGE
-              |
               +----< FINDING
-                       |
                        +----< REMEDIATION_CASE_FINDING
-                                  |
                                   +----> REMEDIATION_CASE
                                             +----< ISSUE_REFERENCE
                                             +----< CORRECTIVE_ACTION_PLAN
