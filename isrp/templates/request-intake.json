@@ -1,0 +1,62 @@
+{
+  "key": "isrp-request-intake",
+  "name": "ISRP Request Intake",
+  "description": "Request intake and coordination for the fused ISRP application.",
+  "domain": "ISRP_REQUEST",
+  "version": 1,
+  "publish": true,
+  "lifecycle_fsm": {
+    "key": "isrp-request-lifecycle",
+    "name": "ISRP request lifecycle",
+    "version": 1,
+    "initial_state": "DRAFT",
+    "states": [
+      {"key": "DRAFT"},
+      {"key": "SUBMITTED"},
+      {"key": "IN_REVIEW"},
+      {"key": "READY_TO_CLOSE"},
+      {"key": "CLOSED", "terminal": true},
+      {"key": "CANCELLED", "terminal": true}
+    ],
+    "transitions": [
+      {"action": "submit", "from": "DRAFT", "to": "SUBMITTED"},
+      {"action": "start_review", "from": "SUBMITTED", "to": "IN_REVIEW"},
+      {"action": "mark_ready", "from": "IN_REVIEW", "to": "READY_TO_CLOSE"},
+      {"action": "close", "from": "READY_TO_CLOSE", "to": "CLOSED"},
+      {"action": "cancel", "from": "DRAFT", "to": "CANCELLED", "reason_required": true},
+      {"action": "cancel", "from": "SUBMITTED", "to": "CANCELLED", "reason_required": true},
+      {"action": "cancel", "from": "IN_REVIEW", "to": "CANCELLED", "reason_required": true},
+      {"action": "reopen", "from": "CLOSED", "to": "IN_REVIEW", "reason_required": true}
+    ]
+  },
+  "steps": [
+    {
+      "key": "await_submission",
+      "name": "Await request submission",
+      "type": "WAIT_SIGNAL",
+      "stage": "Intake",
+      "configuration": {"signal_type": "REQUEST_SUBMITTED"}
+    },
+    {
+      "key": "coordinate_review",
+      "name": "Coordinate security review",
+      "type": "HUMAN_TASK",
+      "stage": "Coordination",
+      "assignment_role": "REVIEW_COORDINATOR",
+      "configuration": {}
+    },
+    {
+      "key": "await_completion",
+      "name": "Await assessment completion",
+      "type": "WAIT_SIGNAL",
+      "stage": "Review",
+      "configuration": {"signal_type": "REQUEST_READY_TO_CLOSE"}
+    },
+    {"key": "end", "name": "Request complete", "type": "END", "stage": "Complete"}
+  ],
+  "transitions": [
+    {"from_step": "await_submission", "to_step": "coordinate_review"},
+    {"from_step": "coordinate_review", "to_step": "await_completion"},
+    {"from_step": "await_completion", "to_step": "end"}
+  ]
+}
