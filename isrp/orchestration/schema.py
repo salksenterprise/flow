@@ -76,12 +76,15 @@ CREATE TABLE IF NOT EXISTS transition_definition (
 CREATE TABLE IF NOT EXISTS isrp_request (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   workflow_version_id INTEGER NOT NULL REFERENCES workflow_version(id),
-  title TEXT NOT NULL,
+  reference TEXT UNIQUE,
+  title TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '',
+  requester_name TEXT NOT NULL DEFAULT '', requester_email TEXT NOT NULL DEFAULT '',
+  organization_name TEXT NOT NULL DEFAULT '', source_system TEXT NOT NULL DEFAULT 'ISRP',
   lifecycle_status TEXT NOT NULL, execution_status TEXT NOT NULL DEFAULT 'RUNNING',
   current_stage TEXT, revision INTEGER NOT NULL DEFAULT 0,
   variables_json TEXT NOT NULL DEFAULT '{}', created_by TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  completed_at TEXT, suspended_at TEXT, cancelled_at TEXT
+  submitted_at TEXT, completed_at TEXT, suspended_at TEXT, cancelled_at TEXT
 );""",
     # An assessment belongs to exactly one request. That foreign key is the
     # whole of the parent-child machinery the engine used to carry in opaque
@@ -251,12 +254,14 @@ CREATE INDEX IF NOT EXISTS idx_step_execution ON step_instance(execution_status,
 CREATE INDEX IF NOT EXISTS idx_command_owner ON workflow_command(owner_type,owner_id);
 CREATE INDEX IF NOT EXISTS idx_request_execution ON isrp_request(execution_status,id);
 CREATE INDEX IF NOT EXISTS idx_assessment_execution ON isrp_assessment(execution_status,id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_request_reference ON isrp_request(reference)
+  WHERE reference IS NOT NULL;
 """
 
 # Stamped into schema_metadata on first initialization. Its presence is what
 # tells initialize() that the legacy 0.2 migration has already been applied and
 # must never run against live rows again.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Applied in order by create_schema for a database stamped below the current
 # version. Each entry is (target_version, method name on the repository).
@@ -266,6 +271,7 @@ MIGRATIONS = (
     (6, "_migrate_to_6_execution_mode"),
     (7, "_migrate_to_7_owner_aggregates"),
     (8, "_migrate_to_8_command_fingerprint"),
+    (9, "_migrate_to_9_request_intake"),
 )
 
 # Stamped onto every outbound message so a consumer can tell which shape it is

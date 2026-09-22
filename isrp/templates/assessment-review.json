@@ -1,0 +1,31 @@
+{
+  "key": "isrp-assessment-review",
+  "name": "ISRP Security Assessment",
+  "description": "Initial security assessment work for a submitted request.",
+  "domain": "ISRP_ASSESSMENT",
+  "version": 1,
+  "publish": true,
+  "steps": [
+    {
+      "key": "review_scope",
+      "name": "Review assessment scope",
+      "type": "HUMAN_TASK",
+      "stage": "Scoping",
+      "assignment_role": "SECURITY_REVIEWER",
+      "configuration": {}
+    },
+    {
+      "key": "record_outcome",
+      "name": "Record assessment outcome",
+      "type": "DECISION",
+      "stage": "Decision",
+      "assignment_role": "SECURITY_REVIEWER",
+      "configuration": {}
+    },
+    {"key": "end", "name": "Assessment complete", "type": "END", "stage": "Complete"}
+  ],
+  "transitions": [
+    {"from_step": "review_scope", "to_step": "record_outcome"},
+    {"from_step": "record_outcome", "to_step": "end"}
+  ]
+}

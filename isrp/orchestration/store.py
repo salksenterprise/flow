@@ -548,6 +548,23 @@ class SQLiteWorkflowRepository:
             self.db.execute(
                 "ALTER TABLE workflow_command ADD COLUMN request_fingerprint TEXT")
 
+    def _migrate_to_9_request_intake(self) -> None:
+        """Add the first ISRP business fields beside request execution state."""
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(isrp_request)")}
+        additions = {
+            "reference": "TEXT",
+            "summary": "TEXT NOT NULL DEFAULT ''",
+            "requester_name": "TEXT NOT NULL DEFAULT ''",
+            "requester_email": "TEXT NOT NULL DEFAULT ''",
+            "organization_name": "TEXT NOT NULL DEFAULT ''",
+            "source_system": "TEXT NOT NULL DEFAULT 'ISRP'",
+            "submitted_at": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                self.db.execute(
+                    f"ALTER TABLE isrp_request ADD COLUMN {name} {declaration}")
+
     def _fold_workflow_instance(self, roots: str) -> None:
         self.db.execute(
             """INSERT INTO isrp_request
@@ -890,6 +907,15 @@ class SQLiteWorkflowRepository:
             "variables_json": json.dumps(data.get("variables", {})),
             "created_by": Actor.from_value(data.get("actor", "system")).actor_id,
         }
+        if owner_type == REQUEST:
+            columns.update({
+                "reference": data.get("reference"),
+                "summary": data.get("summary", ""),
+                "requester_name": data.get("requester_name", ""),
+                "requester_email": data.get("requester_email", ""),
+                "organization_name": data.get("organization_name", ""),
+                "source_system": data.get("source_system", "ISRP"),
+            })
         if owner_type == ASSESSMENT:
             columns.update({
                 "request_id": data["request_id"],
@@ -1578,6 +1604,7 @@ class SQLiteWorkflowRepository:
                            sd.step_key,sd.name,sd.step_type,sd.stage,sd.assignment_role,
                            sd.execution_mode,
                            COALESCE(rq.title,asmt.title) title,
+                           COALESCE(rq.revision,asmt.revision) owner_revision,
                            COALESCE(rq.lifecycle_status,asmt.lifecycle_status) lifecycle_status
                     {source} WHERE {where}
                     ORDER BY si.activated_at,si.id LIMIT ? OFFSET ?""",

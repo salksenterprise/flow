@@ -13,10 +13,62 @@ or package.
 ~~~text
 isrp/orchestration     state machines, the graph driver, timers, jobs,
                        signals, work assignment, the shared event log
+isrp/application.py    transactional ISRP use cases
+isrp/api.py            JSON HTTP adapter and compiled-frontend host
 isrp/templates         published workflow definitions
+frontend               React/Vite ISRP workspace
 tests                  orchestration tests and the adapter contract suite
 docs/isrp              the design
 ~~~
+
+## Run the application
+
+The quickest way to run the complete application is Docker Compose:
+
+~~~bash
+docker compose up --build
+~~~
+
+Open `http://localhost:8000`, then stop the application with:
+
+~~~bash
+docker compose down
+~~~
+
+The SQLite database is stored in the named `isrp-data` volume, so it survives
+`docker compose down`. To remove the database and restart with an empty one,
+use `docker compose down -v`.
+
+After the first build, `docker compose up` reuses the existing image. Use
+`docker compose up --build` whenever source files or dependencies change. You
+can override the host port and development identity with environment variables,
+for example `ISRP_PORT=8080 ISRP_DEVELOPMENT_ACTOR=alex docker compose up`.
+
+### Run without containers
+
+Install and build the frontend once:
+
+~~~bash
+cd frontend
+npm install
+npm run build
+cd ..
+~~~
+
+Start the fused ISRP application:
+
+~~~bash
+PYTHONPATH=. python3 -m isrp.api --database isrp.db
+~~~
+
+Open `http://127.0.0.1:8000`. The same process serves the JSON API and compiled
+React application. For frontend development, run `npm run dev` in `frontend/`;
+Vite proxies `/api` to the Python process on port 8000.
+
+This first slice uses a process-configured development identity
+(`ISRP_DEVELOPMENT_ACTOR`) and does not trust identity headers from the browser.
+Production authentication and authorization remain an enterprise-control
+delivery item; do not expose this development server to an untrusted network.
 
 ## Running the tests
 
@@ -41,6 +93,6 @@ against a real Oracle instance.
 Start with [the ISRP design set](docs/isrp/README.md), and
 [Orchestration](docs/isrp/orchestration.md) for how execution works.
 
-Several documents under `docs/` describe an earlier architecture in which
-orchestration was a separate, domain-neutral product. They are marked superseded
-and are retained only until their content has been folded into the design set.
+The historical Releases 1-3 record under `docs/` describes the retired
+standalone engine. The current architecture is defined only by the ISRP design
+set.
