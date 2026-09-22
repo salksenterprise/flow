@@ -1,4 +1,11 @@
-# Workflow Engine Releases 1–3
+# Workflow Engine Releases 1-3
+
+> **Historical.** This records what the Releases 1-3 delivery contained, when
+> Flow was a standalone service. Several behaviours described here have since
+> changed and the architecture has moved to an embeddable core. For the current
+> state see [the charter](charter.md), [the requirements](requirements.md) and
+> [the technical design](technical-design.md).
+
 
 ## Scope
 

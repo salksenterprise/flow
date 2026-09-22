@@ -107,7 +107,7 @@ integration and `tests/test_embedding.py` holds the contract.
 | EVT-4 | The rule language supports numeric comparison and nested field paths | Done |
 | EVT-5 | A signal arriving before its waiting node is stored and consumed when the node activates | Done |
 | EVT-6 | A signal is consumed exactly once | Done |
-| EVT-7 | A repeated signal command returns the original result without a second effect | Done |
+| EVT-7 | A repeated signal command causes no second effect | Done |
 | EVT-8 | A provider event is deduplicated on connector name and provider event id | Done |
 | EVT-9 | An accepted provider event is translated into a signal through the idempotent command path | Done |
 
@@ -127,7 +127,7 @@ integration and `tests/test_embedding.py` holds the contract.
 
 | ID | Requirement | Status |
 |---|---|---|
-| REL-1 | A repeated command identifier returns the original result and causes no second effect | Done |
+| REL-1 | A repeated command identifier causes no second effect and returns current state | Done |
 | REL-2 | Idempotency is checked before revision validation, so a retry never returns a conflict | Done |
 | REL-3 | A mutation whose expected revision does not match current is refused with no partial write | Done |
 | REL-4 | Every runtime change writes an ordered workflow event in the same transaction | Done |
