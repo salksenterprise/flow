@@ -1,0 +1,17 @@
+services:
+  isrp:
+    build:
+      context: .
+    init: true
+    ports:
+      - "${ISRP_PORT:-8000}:8000"
+    environment:
+      ISRP_DEVELOPMENT_ACTOR: "${ISRP_DEVELOPMENT_ACTOR:-demo.reviewer}"
+      ISRP_DEVELOPMENT_ORGANIZATION: "${ISRP_DEVELOPMENT_ORGANIZATION:-}"
+      ISRP_DEVELOPMENT_ROLES: "${ISRP_DEVELOPMENT_ROLES:-REVIEW_COORDINATOR,SECURITY_REVIEWER}"
+      ISRP_HTTP_LOG: "${ISRP_HTTP_LOG:-1}"
+    volumes:
+      - isrp-data:/data
+
+volumes:
+  isrp-data:

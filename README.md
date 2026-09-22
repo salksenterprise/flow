@@ -23,6 +23,29 @@ docs/isrp              the design
 
 ## Run the application
 
+The quickest way to run the complete application is Docker Compose:
+
+~~~bash
+docker compose up --build
+~~~
+
+Open `http://localhost:8000`, then stop the application with:
+
+~~~bash
+docker compose down
+~~~
+
+The SQLite database is stored in the named `isrp-data` volume, so it survives
+`docker compose down`. To remove the database and restart with an empty one,
+use `docker compose down -v`.
+
+After the first build, `docker compose up` reuses the existing image. Use
+`docker compose up --build` whenever source files or dependencies change. You
+can override the host port and development identity with environment variables,
+for example `ISRP_PORT=8080 ISRP_DEVELOPMENT_ACTOR=alex docker compose up`.
+
+### Run without containers
+
 Install and build the frontend once:
 
 ~~~bash
